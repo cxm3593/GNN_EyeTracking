@@ -9,7 +9,7 @@ import torch
 import pandas as pd
 
 # --- Constants ---
-DATA_PATH = r"C:\Users\cxm3593\Academic\Workspace\Data\ev_eye\raw_data\Data_davis\user1\left\session_1_0_1\events\events.txt"
+DATA_PATH = r"C:\Users\VirgilMA\Academics\Research\GNN_EyeTracking\data\Data_davis\user1\left\session_1_0_1\events\events.txt"
 
 EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
 
