@@ -5,11 +5,15 @@ Main file for the gnn-eyetracking project
 
 from gnn_ev_toolbox.data_tools import DataManager
 from gnn_ev_toolbox.gnn_tools import GnnBuilder
+from gnn_ev_toolbox.three_et_dataloader import ThreeETDataLoader
 import torch
 import pandas as pd
 
 # --- Constants ---
-DATA_PATH = r"C:\Users\cxm3593\Academic\Workspace\Data\ev_eye\raw_data\Data_davis\user1\left\session_1_0_1\events\events.txt"
+# DATA_PATH = r"C:\Users\cxm3593\Academic\Workspace\Data\ev_eye\raw_data\Data_davis\user1\left\session_1_0_1\events\events.txt"
+
+DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data"
+
 
 EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
 
@@ -17,10 +21,10 @@ EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
 
 # --- Helper Functions ---
 
-
-# --- Main Function ---
-def main():
-
+def sample_data_processing():
+    '''
+    The sample code used for testing, not used for now.
+    '''
     print("--------------------------------")
     print("Program started")
     print("--------------------------------")
@@ -50,6 +54,15 @@ def main():
     graph = builder.build_radius_graph(pt, r=10.0)
     print(f"\nGraph: {graph.num_nodes} nodes, {graph.num_edges} edges")
     builder.visualize_graph_3d(graph)
+
+def three_et_data_processing():
+    ThreeETDataLoader(three_et_data_root = DATA_ROOT_3ET)
+
+# --- Main Function ---
+def main():
+
+    three_et_data_processing()
+
 
 if __name__ == "__main__":
     main()

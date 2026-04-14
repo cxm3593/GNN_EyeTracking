@@ -1,0 +1,519 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+.python-version
+main.py
+pyproject.toml
+README.md
+src/gnn_ev_toolbox/__init__.py
+src/gnn_ev_toolbox/data_tools.py
+src/gnn_ev_toolbox/gnn_tools.py
+src/gnn_ev_toolbox/three_et_dataloader.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/gnn_ev_toolbox/three_et_dataloader.py">
+'''
+This module is for loading the 3ET dataset
+@author: Chengyi Ma
+'''
+
+import h5py
+import pandas as pd
+import numpy as np
+import os
+
+class ThreeETDataLoader:
+    '''
+    ThreeETDataLoader is a class that loads the 3ET dataset
+    '''
+    def __init__(self, three_et_data_root:str):
+
+        three_et_data_train_dir = os.path.join(three_et_data_root, "train")
+        three_et_data_test_dir = os.path.join(three_et_data_root, "test")
+
+        # Temporarily only load one session of the data
+        # Get first subdirectory in the train directory
+        train_data_list = os.listdir(three_et_data_train_dir)
+        print(f"Found {len(train_data_list)} sessions in the train directory")
+
+        # Only load one session of the data for now
+        this_train_data_session_id = train_data_list[0]
+        
+        self._load_data_single_session(this_train_data_session_id, three_et_data_train_dir)
+    
+
+
+
+
+    def _load_data_single_session(self, data_session_id:str, data_session_root:str, debug_mode:bool = True):
+        '''
+        load a single .h5 file and corresponding label file from the 3ET dataset
+        Args:
+            data_session_id: the id of the data session
+            data_session_root: the root directory of the data session
+            debug_mode: if True, print debug information
+        Returns:
+            None
+        '''
+        if debug_mode:
+            print(f"Loading data for session {data_session_id}...")
+
+        data_path_session = os.path.join(data_session_root, data_session_id)
+        data_path_h5 = os.path.join(data_path_session, data_session_id + ".h5")
+        data_path_label = os.path.join(data_path_session, "label.txt")
+
+        data_file = h5py.File(data_path_h5, "r")
+
+        if debug_mode:
+            print(f"data file keys: {data_file.keys()}")
+            print(f"data file events head 5 rows: {data_file['events'][:5]}")
+
+
+        t_min = data_file['events']['t'].min()
+        t_max = data_file['events']['t'].max()
+        t_range = t_max - t_min
+
+        if debug_mode:
+            print(f"Data start time: {t_min}, Data end time: {t_max}, Data range: {t_range}")
+
+
+        data_file.close()
+
+        # load label file
+        if os.path.exists(data_path_label):
+
+            # 1. Parse the Labels with Numpy Converters
+            # The delimiter ',' splits the line into columns 0, 1, and 2.
+            # We target column 0 to strip '(' and column 2 to strip ')'
+            cleaners = {
+                0: lambda s: int(s.replace('(', '')),
+                2: lambda s: int(s.replace(')', ''))
+            }
+
+            label_date_structure = np.dtype([('x', 'int16'), ('y', 'int16'), ('z', 'int16')])
+            labels_np = np.loadtxt(
+                data_path_label, 
+                delimiter=',', 
+                converters=cleaners, 
+                dtype=label_date_structure
+            )
+
+            labels_df = pd.DataFrame(labels_np)
+        
+            if debug_mode:
+                print(f"Labels head 5 rows: {labels_np[:5]}")
+                print(f"Labels count: {labels_np.shape[0]}")
+
+
+        if debug_mode:
+            print(f"Data for session {data_session_id} loaded successfully")
+</file>
+
+<file path=".gitignore">
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+</file>
+
+<file path=".python-version">
+3.12
+</file>
+
+<file path="main.py">
+'''
+Main file for the gnn-eyetracking project
+@author: Chengyi Ma
+'''
+
+from gnn_ev_toolbox.data_tools import DataManager
+from gnn_ev_toolbox.gnn_tools import GnnBuilder
+from gnn_ev_toolbox.three_et_dataloader import ThreeETDataLoader
+import torch
+import pandas as pd
+
+# --- Constants ---
+# DATA_PATH = r"C:\Users\cxm3593\Academic\Workspace\Data\ev_eye\raw_data\Data_davis\user1\left\session_1_0_1\events\events.txt"
+
+DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data"
+
+
+EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
+
+# --- Global Variables ---
+
+# --- Helper Functions ---
+
+def sample_data_processing():
+    '''
+    The sample code used for testing, not used for now.
+    '''
+    print("--------------------------------")
+    print("Program started")
+    print("--------------------------------")
+    # Load data
+    print("Loading data...")
+    dm = DataManager()
+    sample_data = dm.load_dataset_EvEye_raw(DATA_PATH)
+    print(sample_data.head())
+    print(sample_data.info())
+
+    ## Evaluate and remove hot pixels
+    print("Evaluating hot pixels...")
+    hot_pixels = dm.evaluate_hotpixels_event_rate(sample_data)
+    print(f"Hot pixels: {hot_pixels}")
+    sample_data = dm.remove_hot_pixels(sample_data, hot_pixels)
+    print(f"Sample data after removing hot pixels: {sample_data.head()}")
+    print(f"Sample data after removing hot pixels: {sample_data.info()}")
+
+    # Convert events to points
+    t_start = sample_data["timestamp"].iloc[0]
+    t_end   = t_start + EXAMPLE_WINDOW_SIZE
+    points = dm.events_to_points_window(sample_data, [t_start, t_end], time_conversion_factor=1e-3)
+
+
+    pt = torch.tensor(points[["x", "y", "t"]].values, dtype=torch.float32)
+    builder = GnnBuilder()
+    graph = builder.build_radius_graph(pt, r=10.0)
+    print(f"\nGraph: {graph.num_nodes} nodes, {graph.num_edges} edges")
+    builder.visualize_graph_3d(graph)
+
+def three_et_data_processing():
+    ThreeETDataLoader(three_et_data_root = DATA_ROOT_3ET)
+
+# --- Main Function ---
+def main():
+
+    three_et_data_processing()
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "gnn-eyetracking"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12, <3.14"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "pandas>=3.0.2",
+    "pyg-lib==0.6.0+pt210cu128",
+    "torch==2.10.*",
+    "torch-cluster==1.6.3+pt210cu128",
+    "torch-geometric==2.7.*",
+    "torch-scatter==2.1.2+pt210cu128",
+    "torch-sparse==0.6.18+pt210cu128",
+    "torchaudio==2.10.*",
+    "torchvision==0.25.*",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gnn_ev_toolbox"]
+
+[tool.uv]
+find-links = ["https://data.pyg.org/whl/torch-2.10.0+cu128.html"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+</file>
+
+<file path="README.md">
+
+</file>
+
+<file path="src/gnn_ev_toolbox/__init__.py">
+
+</file>
+
+<file path="src/gnn_ev_toolbox/data_tools.py">
+'''
+This module is planned to be a toolbox for data loading and preprocessing
+@author: Chengyi Ma
+
+'''
+
+import pandas as pd
+import numpy as np
+
+class DataManager:
+    '''
+    DataManager is a basic class that manages the data loading and preprocessing
+    '''
+    def __init__(self):
+        self.data = None
+
+    def load_dataset_EvEye_raw(self, data_path: str) -> pd.DataFrame:
+        '''
+        Load dataset in Ev-Eye format. The raw data is in txt format.
+        Each line is an event, with the following format:
+        timestamp (microseconds), x, y, polarity
+        And the txt file is usually very large.
+        Args:
+            data_path: the path to the txt file
+        Returns:
+            a pandas dataframe with the following columns:
+            x, y, polarity and timestamp
+        '''
+        self.data = pd.read_csv(
+            data_path,
+            header=None,
+            names=["timestamp", "x", "y", "polarity"],
+            dtype={"timestamp": "int64", "x": "int16", "y": "int16", "polarity": "bool"},
+            sep=" ",
+            engine="c",
+            skip_blank_lines=True,
+        )
+        self.data["timestamp"] = self.data["timestamp"] - self.data["timestamp"].min()
+        return self.data
+
+    def events_to_points_window(self, data: pd.DataFrame, time_window: list[int], time_conversion_factor: float) -> pd.DataFrame:
+        '''
+        Convert events to points in a given time window
+        Args:
+            data: the dataframe containing the events
+            time_window: the time window in microseconds [start, end]
+            time_conversion_factor: the factor to convert the timestamp to 3D space-time coordinates
+        Returns:
+            a dataframe containing the points with columns: x, y, t, polarity
+        '''
+        mask = (data["timestamp"] >= time_window[0]) & (data["timestamp"] <= time_window[1])
+        points = data.loc[mask, ["x", "y", "polarity"]].copy()
+        points["t"] = ((data.loc[mask, "timestamp"] - time_window[0]) * time_conversion_factor).astype("float32")
+        return points[["x", "y", "t", "polarity"]]
+
+    def evaluate_hotpixels_event_rate(self, data: pd.DataFrame, z_thresh: float = 3.5) -> list[tuple[int, int, float]]:
+        '''
+        Evaluate the event rate of every pixel and identify hot-pixel outliers.
+
+        Per-pixel event rates span many orders of magnitude, so the Modified Z-Score
+        is computed on log10-transformed rates. This compresses the heavy right skew
+        into an approximately symmetric distribution and gives a clean separation
+        between true hardware hot pixels and legitimately active scene pixels.
+
+            log_rate     = log10(event_rate_hz)
+            Modified Z   = 0.6745 * (log_rate - median(log_rate)) / MAD(log_rate)
+
+        Pixels whose Modified Z-Score exceeds z_thresh (default 3.5, Iglewicz &
+        Hoaglin 1993) are flagged as hot pixels.
+
+        Args:
+            data: dataframe with columns timestamp (µs), x, y, polarity
+            z_thresh: Modified Z-Score threshold on log10 scale (default 3.5)
+        Returns:
+            list of (x, y, event_rate_hz) tuples for hot pixels, sorted by rate descending
+        '''
+        duration_s = (data["timestamp"].max() - data["timestamp"].min()) / 1e6
+
+        # Event rate (Hz) per pixel
+        rates = (data.groupby(["x", "y"], observed=True)
+                     .size()
+                     .rename("rate")
+                     .astype("float64") / duration_s)
+
+        log_rates = np.log10(rates)
+        median_log = log_rates.median()
+        mad_log    = (log_rates - median_log).abs().median()
+
+        if mad_log == 0:
+            # Degenerate: all pixels have the same rate — no hot pixels possible
+            hot_mask = pd.Series(False, index=rates.index)
+        else:
+            modified_z = 0.6745 * (log_rates - median_log) / mad_log
+            hot_mask   = modified_z > z_thresh
+
+        hot_pixels   = rates[hot_mask].sort_values(ascending=False)
+        median_rate  = rates.median()
+        thresh_hz    = 10 ** (median_log + z_thresh * mad_log / 0.6745)
+
+        # --- report ---
+        print(f"{'='*57}")
+        print(f"  Hot Pixel Report")
+        print(f"{'='*57}")
+        print(f"  Recording duration  : {duration_s:.2f} s")
+        print(f"  Active pixels       : {len(rates):,}")
+        print(f"  Median event rate   : {median_rate:.4f} Hz")
+        print(f"  MAD (log10 scale)   : {mad_log:.4f}")
+        print(f"  Threshold (Z>{z_thresh})  : {thresh_hz:.2f} Hz")
+        print(f"  Hot pixels found    : {len(hot_pixels)}")
+        print(f"{'='*57}")
+        if len(hot_pixels):
+            print(f"  {'x':>5}  {'y':>5}  {'rate (Hz)':>12}  {'× median':>10}")
+            print(f"  {'-'*5}  {'-'*5}  {'-'*12}  {'-'*10}")
+            for (x, y), rate in hot_pixels.items():
+                print(f"  {x:>5}  {y:>5}  {rate:>12.1f}  {rate/median_rate:>9.0f}×")
+        else:
+            print("  No hot pixels detected.")
+        print(f"{'='*57}")
+
+        return [(int(x), int(y), float(r)) for (x, y), r in hot_pixels.items()]
+
+    def remove_hot_pixels(self, data: pd.DataFrame, hot_pixels: list[tuple[int, int, float]]) -> pd.DataFrame:
+        '''
+        Remove hot pixels from the data
+        Args:
+            data: the dataframe containing the events
+            hot_pixels: the list of hot pixels
+        Returns:
+            a dataframe containing the events without the hot pixels
+        '''
+        for pixel in hot_pixels:
+            data = data[~((data["x"] == pixel[0]) & (data["y"] == pixel[1]))]
+        return data
+</file>
+
+<file path="src/gnn_ev_toolbox/gnn_tools.py">
+'''
+This module is planned to be a toolbox for GNN operations
+@author: Chengyi Ma
+'''
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from torch_geometric.data import Data
+from torch_cluster import radius_graph
+
+
+class GnnBuilder:
+    '''
+    GnnBuilder builds graph representations from point cloud data
+    and provides utilities for inspection and visualization.
+    '''
+
+    def build_radius_graph(self, points: torch.Tensor, r: float, max_num_neighbors: int = 32) -> Data:
+        '''
+        Build an undirected radius graph from a set of 3D points.
+        Each node is connected to all other nodes within Euclidean distance r.
+        Args:
+            points: (N, 3) float tensor with columns [x, y, t]
+            r: radius threshold for edge creation
+            max_num_neighbors: maximum edges per node (avoids quadratic blowup on dense regions)
+        Returns:
+            a torch_geometric.data.Data object with:
+                - x:          (N, 3) node feature matrix (the points themselves)
+                - edge_index: (2, E) connectivity in COO format
+                - pos:        (N, 3) node positions (same as x)
+        '''
+        if not isinstance(points, torch.Tensor):
+            points = torch.tensor(points, dtype=torch.float32)
+        else:
+            points = points.float()
+
+        edge_index = radius_graph(points, r=r, loop=False, max_num_neighbors=max_num_neighbors)
+
+        return Data(x=points, edge_index=edge_index, pos=points)
+
+    def visualize_graph_3d(self, graph: Data, title: str = "Graph Visualization", max_edges: int = 5000) -> None:
+        '''
+        Visualize a 3D point-cloud graph. Nodes are plotted as scatter points
+        and edges as line segments. Colour encodes t (time).
+        Axes are (t, x, y): horizontal t, depth x, vertical y — swapped from
+        the stored order [x, y, t] for clearer inspection.
+        Args:
+            graph: a Data object produced by build_radius_graph
+            title: plot title
+            max_edges: cap on the number of edges drawn (random subsample if exceeded),
+                       to keep rendering fast on dense graphs
+        '''
+        pos = graph.pos.numpy()          # (N, 3): x, y, t
+        edge_index = graph.edge_index.numpy()  # (2, E)
+
+        fig = plt.figure(figsize=(10, 7))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # pos columns: 0=x, 1=y, 2=t — plot as (t, x, y)
+        px, py, pt = pos[:, 0], pos[:, 1], pos[:, 2]
+
+        # --- nodes (coloured by t) ---
+        sc = ax.scatter(pt, px, py,
+                        c=pt, cmap='viridis', s=8, alpha=0.7, zorder=3)
+        plt.colorbar(sc, ax=ax, label='t (scaled time)', pad=0.1)
+
+        # --- edges (subsample if too many) ---
+        num_edges = edge_index.shape[1]
+        indices = np.arange(num_edges)
+        if num_edges > max_edges:
+            indices = np.random.choice(indices, size=max_edges, replace=False)
+
+        src, dst = edge_index[0, indices], edge_index[1, indices]
+        for s, d in zip(src, dst):
+            ax.plot([pt[s], pt[d]],
+                    [px[s], px[d]],
+                    [py[s], py[d]],
+                    color='steelblue', alpha=0.15, linewidth=0.5)
+
+        ax.set_xlabel('t (scaled time)')
+        ax.set_ylabel('x (pixels)')
+        ax.set_zlabel('y (pixels)')
+        ax.set_title(f'{title}\n{pos.shape[0]} nodes, {num_edges} edges'
+                     + (f' ({max_edges} shown)' if num_edges > max_edges else ''))
+        plt.tight_layout()
+        plt.show()
+</file>
+
+</files>

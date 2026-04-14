@@ -42,7 +42,9 @@ class GnnBuilder:
     def visualize_graph_3d(self, graph: Data, title: str = "Graph Visualization", max_edges: int = 5000) -> None:
         '''
         Visualize a 3D point-cloud graph. Nodes are plotted as scatter points
-        and edges as line segments. Colour encodes the t (time) axis.
+        and edges as line segments. Colour encodes t (time).
+        Axes are (t, x, y): horizontal t, depth x, vertical y — swapped from
+        the stored order [x, y, t] for clearer inspection.
         Args:
             graph: a Data object produced by build_radius_graph
             title: plot title
@@ -55,9 +57,12 @@ class GnnBuilder:
         fig = plt.figure(figsize=(10, 7))
         ax = fig.add_subplot(111, projection='3d')
 
+        # pos columns: 0=x, 1=y, 2=t — plot as (t, x, y)
+        px, py, pt = pos[:, 0], pos[:, 1], pos[:, 2]
+
         # --- nodes (coloured by t) ---
-        sc = ax.scatter(pos[:, 0], pos[:, 1], pos[:, 2],
-                        c=pos[:, 2], cmap='viridis', s=8, alpha=0.7, zorder=3)
+        sc = ax.scatter(pt, px, py,
+                        c=pt, cmap='viridis', s=8, alpha=0.7, zorder=3)
         plt.colorbar(sc, ax=ax, label='t (scaled time)', pad=0.1)
 
         # --- edges (subsample if too many) ---
@@ -68,14 +73,14 @@ class GnnBuilder:
 
         src, dst = edge_index[0, indices], edge_index[1, indices]
         for s, d in zip(src, dst):
-            ax.plot([pos[s, 0], pos[d, 0]],
-                    [pos[s, 1], pos[d, 1]],
-                    [pos[s, 2], pos[d, 2]],
+            ax.plot([pt[s], pt[d]],
+                    [px[s], px[d]],
+                    [py[s], py[d]],
                     color='steelblue', alpha=0.15, linewidth=0.5)
 
-        ax.set_xlabel('x (pixels)')
-        ax.set_ylabel('y (pixels)')
-        ax.set_zlabel('t (scaled time)')
+        ax.set_xlabel('t (scaled time)')
+        ax.set_ylabel('x (pixels)')
+        ax.set_zlabel('y (pixels)')
         ax.set_title(f'{title}\n{pos.shape[0]} nodes, {num_edges} edges'
                      + (f' ({max_edges} shown)' if num_edges > max_edges else ''))
         plt.tight_layout()
