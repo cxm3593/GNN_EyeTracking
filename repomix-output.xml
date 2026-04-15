@@ -54,190 +54,8 @@ src/gnn_ev_toolbox/three_et_dataloader.py
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/gnn_ev_toolbox/three_et_dataloader.py">
-'''
-This module is for loading the 3ET dataset
-@author: Chengyi Ma
-'''
-
-import h5py
-import pandas as pd
-import numpy as np
-import os
-
-class ThreeETDataLoader:
-    '''
-    ThreeETDataLoader is a class that loads the 3ET dataset
-    '''
-    def __init__(self, three_et_data_root:str):
-
-        three_et_data_train_dir = os.path.join(three_et_data_root, "train")
-        three_et_data_test_dir = os.path.join(three_et_data_root, "test")
-
-        # Temporarily only load one session of the data
-        # Get first subdirectory in the train directory
-        train_data_list = os.listdir(three_et_data_train_dir)
-        print(f"Found {len(train_data_list)} sessions in the train directory")
-
-        # Only load one session of the data for now
-        this_train_data_session_id = train_data_list[0]
-        
-        self._load_data_single_session(this_train_data_session_id, three_et_data_train_dir)
-    
-
-
-
-
-    def _load_data_single_session(self, data_session_id:str, data_session_root:str, debug_mode:bool = True):
-        '''
-        load a single .h5 file and corresponding label file from the 3ET dataset
-        Args:
-            data_session_id: the id of the data session
-            data_session_root: the root directory of the data session
-            debug_mode: if True, print debug information
-        Returns:
-            None
-        '''
-        if debug_mode:
-            print(f"Loading data for session {data_session_id}...")
-
-        data_path_session = os.path.join(data_session_root, data_session_id)
-        data_path_h5 = os.path.join(data_path_session, data_session_id + ".h5")
-        data_path_label = os.path.join(data_path_session, "label.txt")
-
-        data_file = h5py.File(data_path_h5, "r")
-
-        if debug_mode:
-            print(f"data file keys: {data_file.keys()}")
-            print(f"data file events head 5 rows: {data_file['events'][:5]}")
-
-
-        t_min = data_file['events']['t'].min()
-        t_max = data_file['events']['t'].max()
-        t_range = t_max - t_min
-
-        if debug_mode:
-            print(f"Data start time: {t_min}, Data end time: {t_max}, Data range: {t_range}")
-
-
-        data_file.close()
-
-        # load label file
-        if os.path.exists(data_path_label):
-
-            # 1. Parse the Labels with Numpy Converters
-            # The delimiter ',' splits the line into columns 0, 1, and 2.
-            # We target column 0 to strip '(' and column 2 to strip ')'
-            cleaners = {
-                0: lambda s: int(s.replace('(', '')),
-                2: lambda s: int(s.replace(')', ''))
-            }
-
-            label_date_structure = np.dtype([('x', 'int16'), ('y', 'int16'), ('z', 'int16')])
-            labels_np = np.loadtxt(
-                data_path_label, 
-                delimiter=',', 
-                converters=cleaners, 
-                dtype=label_date_structure
-            )
-
-            labels_df = pd.DataFrame(labels_np)
-        
-            if debug_mode:
-                print(f"Labels head 5 rows: {labels_np[:5]}")
-                print(f"Labels count: {labels_np.shape[0]}")
-
-
-        if debug_mode:
-            print(f"Data for session {data_session_id} loaded successfully")
-</file>
-
-<file path=".gitignore">
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-</file>
-
 <file path=".python-version">
 3.12
-</file>
-
-<file path="main.py">
-'''
-Main file for the gnn-eyetracking project
-@author: Chengyi Ma
-'''
-
-from gnn_ev_toolbox.data_tools import DataManager
-from gnn_ev_toolbox.gnn_tools import GnnBuilder
-from gnn_ev_toolbox.three_et_dataloader import ThreeETDataLoader
-import torch
-import pandas as pd
-
-# --- Constants ---
-# DATA_PATH = r"C:\Users\cxm3593\Academic\Workspace\Data\ev_eye\raw_data\Data_davis\user1\left\session_1_0_1\events\events.txt"
-
-DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data"
-
-
-EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
-
-# --- Global Variables ---
-
-# --- Helper Functions ---
-
-def sample_data_processing():
-    '''
-    The sample code used for testing, not used for now.
-    '''
-    print("--------------------------------")
-    print("Program started")
-    print("--------------------------------")
-    # Load data
-    print("Loading data...")
-    dm = DataManager()
-    sample_data = dm.load_dataset_EvEye_raw(DATA_PATH)
-    print(sample_data.head())
-    print(sample_data.info())
-
-    ## Evaluate and remove hot pixels
-    print("Evaluating hot pixels...")
-    hot_pixels = dm.evaluate_hotpixels_event_rate(sample_data)
-    print(f"Hot pixels: {hot_pixels}")
-    sample_data = dm.remove_hot_pixels(sample_data, hot_pixels)
-    print(f"Sample data after removing hot pixels: {sample_data.head()}")
-    print(f"Sample data after removing hot pixels: {sample_data.info()}")
-
-    # Convert events to points
-    t_start = sample_data["timestamp"].iloc[0]
-    t_end   = t_start + EXAMPLE_WINDOW_SIZE
-    points = dm.events_to_points_window(sample_data, [t_start, t_end], time_conversion_factor=1e-3)
-
-
-    pt = torch.tensor(points[["x", "y", "t"]].values, dtype=torch.float32)
-    builder = GnnBuilder()
-    graph = builder.build_radius_graph(pt, r=10.0)
-    print(f"\nGraph: {graph.num_nodes} nodes, {graph.num_edges} edges")
-    builder.visualize_graph_3d(graph)
-
-def three_et_data_processing():
-    ThreeETDataLoader(three_et_data_root = DATA_ROOT_3ET)
-
-# --- Main Function ---
-def main():
-
-    three_et_data_processing()
-
-
-if __name__ == "__main__":
-    main()
 </file>
 
 <file path="pyproject.toml">
@@ -259,6 +77,7 @@ dependencies = [
     "torch-sparse==0.6.18+pt210cu128",
     "torchaudio==2.10.*",
     "torchvision==0.25.*",
+    "h5py"
 ]
 
 [build-system]
@@ -280,10 +99,6 @@ torchaudio = { index = "pytorch-cu128" }
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
-</file>
-
-<file path="README.md">
-
 </file>
 
 <file path="src/gnn_ev_toolbox/__init__.py">
@@ -426,6 +241,289 @@ class DataManager:
         return data
 </file>
 
+<file path="src/gnn_ev_toolbox/three_et_dataloader.py">
+'''
+This module is for loading the 3ET dataset
+@author: Chengyi Ma
+'''
+
+import h5py
+import pandas as pd
+import numpy as np
+import os
+import torch
+
+from torch_geometric.data import Dataset, Data
+from gnn_ev_toolbox.gnn_tools import GnnBuilder
+
+class ThreeETDataLoader:
+    '''
+    ThreeETDataLoader is a class that loads the 3ET dataset
+    '''
+    def __init__(self, three_et_data_root: str, session_id: str | None = None, split: str = "train"):
+
+        split_dir = os.path.join(three_et_data_root, split)
+
+        # Temporarily only load one session of the data
+        # Get subdirectories in the split directory
+        session_list = sorted(os.listdir(split_dir))
+        print(f"Found {len(session_list)} sessions in the {split} directory")
+
+        # Choose which session to load
+        if session_id is None or session_id == "auto":
+            chosen_session_id = session_list[0]
+        else:
+            if session_id not in session_list:
+                raise FileNotFoundError(
+                    f"Session '{session_id}' not found under '{split_dir}'. "
+                    f"Example available session: '{session_list[0] if session_list else '<none>'}'"
+                )
+            chosen_session_id = session_id
+
+        self.session_id = chosen_session_id
+        self.split = split
+        self.data_df, self.labels_df = self._load_data_single_session(chosen_session_id, split_dir)
+
+
+    def _load_data_single_session(self, data_session_id:str, data_session_root:str, debug_mode:bool = True):
+        '''
+        Load a single .h5 file and corresponding label file from the 3ET dataset
+        Args:
+            data_session_id: the id of the data session
+            data_session_root: the root directory of the data session
+            debug_mode: if True, print debug information
+        Returns:
+            data_df: a pandas dataframe with the events data
+            labels_df: a pandas dataframe with the labels data
+        '''
+        if debug_mode:
+            print(f"Loading data for session {data_session_id}...")
+
+        data_path_session = os.path.join(data_session_root, data_session_id)
+        data_path_h5 = os.path.join(data_path_session, data_session_id + ".h5")
+        data_path_label = os.path.join(data_path_session, "label.txt")
+
+        data_file = h5py.File(data_path_h5, "r")
+
+        # Convert HDF5 structured dataset into a columnar DataFrame.
+        # `pd.DataFrame(data_file['events'])` can produce a single column with a structured dtype,
+        # which then breaks downstream `data_df['t']` / `['x']` access.
+        events_np = np.array(data_file["events"])
+        data_df = pd.DataFrame.from_records(events_np)
+
+        if debug_mode:
+            print(f"data file keys: {data_file.keys()}")
+            # Printing the DataFrame directly can crash when HDF5 structured dtypes
+            # contain non-numeric fields that trigger Pandas' formatting checks.
+            try:
+                events_preview = events_np[:5]
+                print(f"data file events first 5 raw rows: {events_preview}")
+            except Exception as e:
+                print(f"Could not preview raw events rows due to: {e}")
+            print(f"data_df columns: {list(data_df.columns)}")
+            print(f"data_df dtypes: {data_df.dtypes.to_dict()}")
+
+
+        t_min = data_file['events']['t'].min()
+        t_max = data_file['events']['t'].max()
+        t_range = t_max - t_min
+
+        if debug_mode:
+            print(f"Data start time: {t_min}, Data end time: {t_max}, Data range: {t_range}")
+
+
+        data_file.close()
+
+        # load label file
+        labels_df = pd.DataFrame()
+        if os.path.exists(data_path_label):
+
+            # 1. Parse the Labels with Numpy Converters
+            # The delimiter ',' splits the line into columns 0, 1, and 2.
+            # We target column 0 to strip '(' and column 2 to strip ')'
+            cleaners = {
+                0: lambda s: int(s.replace('(', '')),
+                2: lambda s: int(s.replace(')', ''))
+            }
+
+            label_date_structure = np.dtype([('x', 'int16'), ('y', 'int16'), ('z', 'int16')])
+            labels_np = np.loadtxt(
+                data_path_label, 
+                delimiter=',', 
+                converters=cleaners, 
+                dtype=label_date_structure
+            )
+
+            labels_df = pd.DataFrame(labels_np)
+        
+            if debug_mode:
+                print(f"Labels head 5 rows: {labels_np[:5]}")
+                print(f"Labels count: {labels_np.shape[0]}")
+
+
+        if debug_mode:
+            print(f"Data for session {data_session_id} loaded successfully")
+
+        return data_df, labels_df
+
+class ThreeETDataset(Dataset):
+    def __init__(self, three_et_data_root, session_id, spatial_scale=0.125, 
+                 graph_radius=10.0, temporal_subsample=5):
+        super().__init__(root=three_et_data_root)
+        
+        # 1. New Parameter: temporal_subsample
+        # If 5, we turn 100Hz labels into 20Hz training steps.
+        self.temporal_subsample = temporal_subsample
+        
+        # Instantiate your loader 
+        self.session_id = session_id
+        self.loader = ThreeETDataLoader(three_et_data_root, session_id=session_id, split="train")
+        
+        self.spatial_scale = spatial_scale
+        self.builder = GnnBuilder() 
+        self.graph_radius = graph_radius
+
+    def len(self):
+        # 2. Divide total labels by subsample factor.
+        # This tells the model how many 20Hz "steps" are in the recording.
+        return len(self.loader.labels_df) // self.temporal_subsample
+
+    def get(self, idx):
+        # 3. The "Multiplier": Map 20Hz index back to 100Hz label row.
+        # Example: idx 1 becomes row 5 (50ms).
+        actual_label_idx = idx * self.temporal_subsample
+        
+        # 4. The "Anchor": Where is the target label in time?
+        t_target = actual_label_idx * 10_000 
+        
+        # 5. The "Constant Beam": Always look 100ms into the past.
+        t_start = t_target - 100_000 
+
+        # Slicing from your loader's data_df
+        all_t = self.loader.data_df['t'].values
+        start_idx = np.searchsorted(all_t, max(0, t_start))
+        end_idx = np.searchsorted(all_t, t_target)
+        window = self.loader.data_df.iloc[start_idx:end_idx]
+
+        # Process coordinates and build graph
+        coords = np.column_stack((
+            window['x'].values * self.spatial_scale, 
+            window['y'].values * self.spatial_scale, 
+            window['t'].values
+        ))
+        coords_tensor = torch.tensor(coords, dtype=torch.float32)
+
+        if coords_tensor.size(0) > 0:
+            graph = self.builder.build_radius_graph(coords_tensor, r=self.graph_radius)
+        else:
+            graph = Data(x=torch.empty((0, 3)), edge_index=torch.empty((2, 0), dtype=torch.long))
+
+        # 6. Bind the Scaled Label using the actual_label_idx
+        target_x = float(self.loader.labels_df.iloc[actual_label_idx]['x']) * self.spatial_scale
+        target_y = float(self.loader.labels_df.iloc[actual_label_idx]['y']) * self.spatial_scale
+        graph.y = torch.tensor([[target_x, target_y]], dtype=torch.float32)
+
+        return graph
+</file>
+
+<file path=".gitignore">
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data
+data
+</file>
+
+<file path="README.md">
+# GNN_EyeTracking
+
+An experimental framework for event-based eye tracking using Graph Neural Networks (GNNs). 
+
+## Project Summary
+
+This project explores the application of Graph Neural Networks to neuromorphic event-based vision data (such as the EvEye dataset) for continuous gaze and pupil position regression. Event cameras produce asynchronous streams of data with microsecond resolution, making them ideal for ultra-low latency eye tracking. 
+
+Unlike traditional frame-based CNN approaches, this project models the event stream as a spatio-temporal graph. The goal is to evaluate, optimize, and innovate on graph construction and processing methods to achieve high-accuracy, low-power continuous coordinate regression.
+
+## How to Run
+
+This project uses [`uv`](https://docs.astral.sh/uv/) as its ultra-fast Python package and environment manager.
+
+### Prerequisites
+Make sure you have `uv` installed on your system.
+
+## Installation
+1. Clone the repository:
+```bash
+git clone https://github.com/cxm3593/GNN_EyeTracking.git
+cd GNN_EyeTracking
+```
+2. Sync the project and install dependencies:
+```
+uv sync
+```
+3. Run the code
+```
+uv run main.py
+```
+
+This project is implemented with Ev-Eye dataset. We will try to support other dataset in future. 
+
+## Project Description and Roadmap
+
+### Basic study: Static GNNs & Optical Flow Distance Metric (Current)
+
+The initial phase focuses on establishing a baseline by building static graphs from time-windows of events and predicting continuous (x,y) pupil coordinates via regression (e.g., using Huber Loss).
+
+**Optical Flow Distance Metric**: Traditional event graphs connect nodes based on a simple spatio-temporal radius (Euclidean distance) and arbitrary or tuned weight parameters. In this project, we are introducing a novel dynamic distance metric. We estimate the optical flow velocity of the events. To measure the true relationship between two events occurring at different times, we use their velocities to forward-project the older event and backward-project the newer event to a shared temporal plane and then calculate the sum of distances at the two timestamps. This method aims to improve the result of radius based graph building method for events with different motion speeds with robustness. 
+
+### Improvement 1: Asynchronous GNNs (Inspired by AEGNN)
+Static batches destroy the asynchronous nature of event cameras. In the second phase, we will adopt and evaluate methodologies from AEGNN (Asynchronous Event-based Graph Neural Networks).
+
+* Goal: Instead of reprocessing the entire graph for every new window, we will implement asynchronous updates where only the nodes affected by newly arriving events trigger network activations.
+
+* Technique: Integrating spatial subsampling and event-driven message passing to drastically reduce redundant computations while maintaining regression accuracy.
+
+### Improvement 2: Directed Dynamic Graphs (Inspired by EvGNN)
+
+To further optimize the performance of GNN on event data, we are evaluating the method proposed by EvGNN which adopts a dynamic graph with directed edges only from older nodes(events) to newer nodes.
+
+* Goal: Implement a strictly causal, directed graph architecture.
+* Technique: Edges will only be permitted to point from past events to future events. We will implement dynamic graph construction using fixed-size, pixel-specific memory queues. This naturally evicts stale events and limits the spatial search space, resulting in a lightweight, dynamically evolving graph optimized for edge-computing deployment.
+
+*The may choose to evaluate and adopt one of the improvements*
+
+## References
+
+[1] Y. Yang, A. Kneip, and C. Frenkel, “EvGNN: An Event-Driven Graph Neural Network Accelerator for Edge Vision,” IEEE Transactions on Circuits and Systems for Artificial Intelligence, vol. 2, no. 1, pp. 37–50, Mar. 2025, doi: 10.1109/TCASAI.2024.3520905.
+
+[2] S. Schaefer, D. Gehrig, and D. Scaramuzza, “AEGNN: Asynchronous Event-Based Graph Neural Networks,” presented at the Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, 2022, pp. 12371–12381. Accessed: May 15, 2025. [Online]. Available: https://openaccess.thecvf.com/content/CVPR2022/html/Schaefer_AEGNN_Asynchronous_Event-Based_Graph_Neural_Networks_CVPR_2022_paper.html
+
+[3] G. Dong et al., “Graph Neural Networks in IoT: A Survey,” ACM Trans. Sen. Netw., vol. 19, no. 2, p. 47:1-47:50, Apr. 2023, doi: 10.1145/3565973.
+
+[4] Z. A. Sahili and M. Awad, “Spatio-Temporal Graph Neural Networks: A Survey,” Feb. 11, 2023, arXiv: arXiv:2301.10569. doi: 10.48550/arXiv.2301.10569.
+
+[5] N. Bandara, T. Kandappu, A. Sen, I. Gokarn, and A. Misra, “EyeGraph: Modularity-aware Spatio Temporal Graph Clustering for Continuous Event-based Eye Tracking”.
+
+[6] G. Zhao et al., “EV-Eye: Rethinking High-frequency Eye Tracking through the Lenses of Event Cameras”.
+
+[7] T. Dalgaty, T. Mesquida, D. Joubert, A. Sironi, P. Vivet, and C. Posch, “HUGNet: Hemi-Spherical Update Graph Neural Network applied to low-latency event-based optical flow,” in 2023 IEEE/CVF Conference on Computer Vision and Pattern Recognition Workshops (CVPRW), Jun. 2023, pp. 3953–3962. doi: 10.1109/CVPRW59228.2023.00411.
+
+[8] M. Fey and J. E. Lenssen, “Fast Graph Representation Learning with PyTorch Geometric,” Apr. 25, 2019, arXiv: arXiv:1903.02428. doi: 10.48550/arXiv.1903.02428.
+
+[9] Z. Wu, S. Pan, F. Chen, G. Long, C. Zhang, and P. S. Yu, “A Comprehensive Survey on Graph Neural Networks,” IEEE Transactions on Neural Networks and Learning Systems, vol. 32, no. 1, pp. 4–24, Jan. 2021, doi: 10.1109/TNNLS.2020.2978386.
+
+[10] Y. Bi, A. Chadha, A. Abbas, E. Bourtsoulatze, and Y. Andreopoulos, “Graph-Based Spatio-Temporal Feature Learning for Neuromorphic Vision Sensing,” IEEE Transactions on Image Processing, vol. 29, pp. 9084–9098, 2020, doi: 10.1109/TIP.2020.3023597.
+</file>
+
 <file path="src/gnn_ev_toolbox/gnn_tools.py">
 '''
 This module is planned to be a toolbox for GNN operations
@@ -514,6 +612,142 @@ class GnnBuilder:
                      + (f' ({max_edges} shown)' if num_edges > max_edges else ''))
         plt.tight_layout()
         plt.show()
+</file>
+
+<file path="main.py">
+'''
+Main file for the gnn-eyetracking project
+@author: Chengyi Ma
+'''
+
+from gnn_ev_toolbox.data_tools import DataManager
+from gnn_ev_toolbox.gnn_tools import GnnBuilder
+from gnn_ev_toolbox.three_et_dataloader import ThreeETDataLoader, ThreeETDataset
+import torch
+import pandas as pd
+import os
+from torch_geometric.loader import DataLoader as PyGDataLoader
+
+# --- Constants ---
+DATA_PATH = None  # Set this if you use `sample_data_processing()`.
+
+# DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data" # The path in lab machine
+DATA_ROOT_3ET = r"C:\Users\VirgilMA\Academics\Research\Data\3ET+ dataset\event_data" # The path in home machine
+
+EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
+
+VISUALIZATION_MODE = True
+
+# --- Global Variables ---
+
+# --- Helper Functions ---
+
+def sample_data_processing():
+    '''
+    The sample code used for testing, not used for now.
+    '''
+    print("--------------------------------")
+    print("Program started")
+    print("--------------------------------")
+    # Load data
+    print("Loading data...")
+    dm = DataManager()
+    sample_data = dm.load_dataset_EvEye_raw(DATA_PATH)
+    print(sample_data.head())
+    print(sample_data.info())
+
+    ## Evaluate and remove hot pixels
+    print("Evaluating hot pixels...")
+    hot_pixels = dm.evaluate_hotpixels_event_rate(sample_data)
+    print(f"Hot pixels: {hot_pixels}")
+    sample_data = dm.remove_hot_pixels(sample_data, hot_pixels)
+    print(f"Sample data after removing hot pixels: {sample_data.head()}")
+    print(f"Sample data after removing hot pixels: {sample_data.info()}")
+
+    # Convert events to points
+    t_start = sample_data["timestamp"].iloc[0]
+    t_end   = t_start + EXAMPLE_WINDOW_SIZE
+    points = dm.events_to_points_window(sample_data, [t_start, t_end], time_conversion_factor=1e-3)
+
+
+    pt = torch.tensor(points[["x", "y", "t"]].values, dtype=torch.float32)
+    builder = GnnBuilder()
+    graph = builder.build_radius_graph(pt, r=10.0)
+    print(f"\nGraph: {graph.num_nodes} nodes, {graph.num_edges} edges")
+    builder.visualize_graph_3d(graph)
+
+def three_et_data_processing():
+    
+    if not os.path.isdir(DATA_ROOT_3ET):
+        raise FileNotFoundError(
+            f"3ET+ data root not found: {DATA_ROOT_3ET}\n"
+            "Update DATA_ROOT_3ET in main.py to point at the dataset root that contains 'train/' and 'test/'."
+        )
+
+    print("--------------------------------")
+    print("3ET+ smoke test started")
+    print("--------------------------------")
+
+    # Minimal: ensure the raw loader works.
+    loader = ThreeETDataLoader(three_et_data_root=DATA_ROOT_3ET)
+    print(f"Events DF shape: {loader.data_df.shape}")
+    print(f"Labels DF shape: {loader.labels_df.shape}")
+
+    # Minimal: ensure the PyG dataset builds at least one graph.
+    dataset = ThreeETDataset(
+        three_et_data_root=DATA_ROOT_3ET,
+        session_id="auto",
+        spatial_scale=0.125,
+        graph_radius=10.0,
+        temporal_subsample=5,
+    )
+    print(f"Dataset length (steps): {len(dataset)}")
+
+    # --- Visualization for testing ---
+    if VISUALIZATION_MODE:
+        # Find a non-empty sample (early indices can be empty depending on label time).
+        sample = None
+        sample_idx = None
+        for i in range(min(len(dataset), 50)):
+            g = dataset[i]
+            if g.num_nodes > 0:
+                sample = g
+                sample_idx = i
+                break
+
+        if sample is None:
+            sample = dataset[0]
+            sample_idx = 0
+
+        print(
+            f"Sample graph (idx={sample_idx}): "
+            f"nodes={sample.num_nodes}, edges={sample.num_edges}, "
+            f"x_shape={tuple(sample.x.shape)}, y_shape={tuple(sample.y.shape)}"
+        )
+
+        # Visualize the sample graph (3D).
+        if sample.num_nodes > 0 and sample.num_edges > 0:
+            GnnBuilder().visualize_graph_3d(sample, title=f"3ET+ sample graph (idx={sample_idx})")
+
+    #--- Visualization end ---
+
+    # Optional: verify batching works (no plotting).
+    dl = PyGDataLoader(dataset, batch_size=2, shuffle=False)
+    batch = next(iter(dl))
+    print(
+        "Batch graph: "
+        f"graphs={batch.num_graphs}, nodes={batch.num_nodes}, edges={batch.num_edges}, "
+        f"x_shape={tuple(batch.x.shape)}, y_shape={tuple(batch.y.shape)}"
+    )
+
+# --- Main Function ---
+def main():
+
+    three_et_data_processing()
+
+
+if __name__ == "__main__":
+    main()
 </file>
 
 </files>
