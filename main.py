@@ -5,31 +5,44 @@ Main file for the gnn-eyetracking project
 
 from gnn_ev_toolbox.data_tools import DataManager
 from gnn_ev_toolbox.gnn_tools import GnnBuilder
-from gnn_ev_toolbox.three_et_dataloader import ThreeETDataLoader, ThreeETDataset
+from gnn_ev_toolbox.three_et_dataloader import (
+    ThreeETDataset,
+    train_val_session_ids_split,
+)
 import torch
-import pandas as pd
 import os
+from torch.utils.data import ConcatDataset
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from gnn_ev_toolbox.models import SimplePupilGNN
-import matplotlib.pyplot as plt
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 # --- Constants ---
 DATA_PATH = None  # Set this if you use `sample_data_processing()`.
 
-# DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data" # The path in lab machine
-DATA_ROOT_3ET = r"C:\Users\VirgilMA\Academics\Research\Data\3ET+ dataset\event_data" # The path in home machine
+DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data" # The path in lab machine
+# DATA_ROOT_3ET = r"C:\Users\VirgilMA\Academics\Research\Data\3ET+ dataset\event_data" # The path in home machine
 
 EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
 
 VISUALIZATION_MODE = False
-PLOT_LOSS_CURVE = True
-LIVE_LOSS_PLOT = True
+TENSORBOARD_ROOT = "runs"
+CHECKPOINT_ROOT = "checkpoints"
+
+# Dataset parameters shared across every session in the concat datasets.
+SPATIAL_SCALE = 1.0
+GRAPH_RADIUS = 10.0
+TEMPORAL_SUBSAMPLE = 5
+MAX_NUM_NEIGHBORS = 8  # Hard cap on edges per node (radius_graph). Lower = less GPU memory.
+
+VAL_FRACTION = 0.2
+SPLIT_SEED = 42
 
 # --- Global Variables ---
 LEARNING_RATE = 0.01
-BATCH_SIZE = 4
-EPOCHS = 100
+BATCH_SIZE = 2
+EPOCHS = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Helper Functions ---
@@ -68,184 +81,291 @@ def sample_data_processing():
     print(f"\nGraph: {graph.num_nodes} nodes, {graph.num_edges} edges")
     builder.visualize_graph_3d(graph)
 
-def three_et_data_processing():
-    
-    if not os.path.isdir(DATA_ROOT_3ET):
+def _list_sessions(data_root: str, split: str) -> list[str]:
+    split_dir = os.path.join(data_root, split)
+    if not os.path.isdir(split_dir):
+        raise FileNotFoundError(f"Split directory not found: {split_dir}")
+    return sorted(
+        name for name in os.listdir(split_dir)
+        if os.path.isdir(os.path.join(split_dir, name))
+    )
+
+
+def _build_session_datasets(data_root: str, split: str, session_ids: list[str]) -> list[ThreeETDataset]:
+    datasets: list[ThreeETDataset] = []
+    for sid in session_ids:
+        datasets.append(
+            ThreeETDataset(
+                root=data_root,
+                session_id=sid,
+                split=split,
+                spatial_scale=SPATIAL_SCALE,
+                graph_radius=GRAPH_RADIUS,
+                temporal_subsample=TEMPORAL_SUBSAMPLE,
+                max_num_neighbors=MAX_NUM_NEIGHBORS,
+                log=False,
+            )
+        )
+    return datasets
+
+
+def build_3et_datasets(
+    data_root: str,
+    val_fraction: float = VAL_FRACTION,
+    seed: int = SPLIT_SEED,
+) -> tuple[ConcatDataset, ConcatDataset, ConcatDataset, dict]:
+    '''
+    Enumerate every session under ``<data_root>/train`` and ``<data_root>/test``,
+    split the training sessions into train/validation by session id (no leakage),
+    and return concatenated datasets ready for a PyG DataLoader.
+
+    Returns:
+        (train_ds, val_ds, test_ds, info) where ``info`` contains the session
+        ids used for each split.
+    '''
+    if not os.path.isdir(data_root):
         raise FileNotFoundError(
-            f"3ET+ data root not found: {DATA_ROOT_3ET}\n"
+            f"3ET+ data root not found: {data_root}\n"
             "Update DATA_ROOT_3ET in main.py to point at the dataset root that contains 'train/' and 'test/'."
         )
 
-    print("--------------------------------")
-    print("3ET+ smoke test started")
-    print("--------------------------------")
+    all_train_sessions = _list_sessions(data_root, "train")
+    all_test_sessions = _list_sessions(data_root, "test")
+    print(f"Train sessions found: {len(all_train_sessions)}")
+    print(f"Test sessions found : {len(all_test_sessions)}")
 
-    # Minimal: ensure the raw loader works.
-    loader = ThreeETDataLoader(three_et_data_root=DATA_ROOT_3ET)
-    print(f"Events DF shape: {loader.data_df.shape}")
-    print(f"Labels DF shape: {loader.labels_df.shape}")
-
-    # Minimal: ensure the PyG dataset builds at least one graph.
-    dataset = ThreeETDataset(
-        three_et_data_root=DATA_ROOT_3ET,
-        session_id="auto",
-        spatial_scale=0.125,
-        graph_radius=10.0,
-        temporal_subsample=5,
+    train_sessions, val_sessions = train_val_session_ids_split(
+        all_train_sessions, val_fraction=val_fraction, random_seed=seed
     )
-    print(f"Dataset length (steps): {len(dataset)}")
-
-    # --- Visualization for testing ---
-    if VISUALIZATION_MODE:
-        # Find a non-empty sample (early indices can be empty depending on label time).
-        sample = None
-        sample_idx = None
-        for i in range(min(len(dataset), 50)):
-            g = dataset[i]
-            if g.num_nodes > 0:
-                sample = g
-                sample_idx = i
-                break
-
-        if sample is None:
-            sample = dataset[0]
-            sample_idx = 0
-
-        print(
-            f"Sample graph (idx={sample_idx}): "
-            f"nodes={sample.num_nodes}, edges={sample.num_edges}, "
-            f"x_shape={tuple(sample.x.shape)}, y_shape={tuple(sample.y.shape)}"
-        )
-
-        # Visualize the sample graph (3D).
-        if sample.num_nodes > 0 and sample.num_edges > 0:
-            GnnBuilder().visualize_graph_3d(sample, title=f"3ET+ sample graph (idx={sample_idx})")
-
-    
-
-    #--- Visualization end ---
-
-    # Optional: verify batching works (no plotting).
-    dl = PyGDataLoader(dataset, batch_size=2, shuffle=False)
-    batch = next(iter(dl))
     print(
-        "Batch graph: "
-        f"graphs={batch.num_graphs}, nodes={batch.num_nodes}, edges={batch.num_edges}, "
-        f"x_shape={tuple(batch.x.shape)}, y_shape={tuple(batch.y.shape)}"
+        f"Split train/val by session: {len(train_sessions)} train / "
+        f"{len(val_sessions)} val (seed={seed}, val_fraction={val_fraction})"
     )
 
-    return dataset
+    train_list = _build_session_datasets(data_root, "train", train_sessions)
+    val_list = _build_session_datasets(data_root, "train", val_sessions)
+    test_list = _build_session_datasets(data_root, "test", all_test_sessions)
+
+    train_ds = ConcatDataset(train_list)
+    val_ds = ConcatDataset(val_list)
+    test_ds = ConcatDataset(test_list)
+
+    print(
+        f"Concat sizes (steps): train={len(train_ds)}, val={len(val_ds)}, "
+        f"test={len(test_ds)}"
+    )
+
+    info = {
+        "train_sessions": train_sessions,
+        "val_sessions": val_sessions,
+        "test_sessions": all_test_sessions,
+    }
+    return train_ds, val_ds, test_ds, info
 
 
-def model_training(dataset, device="cpu", epochs=10, learning_rate=0.01, batch_size=4):
-    # 1. Initialize Model
+def _gpu_mem_mb(device) -> dict[str, float]:
+    '''Return GPU memory stats in MiB; all zeros on CPU.
+
+    Keys:
+      alloc      : currently allocated tensor bytes
+      peak_alloc : peak allocated since last reset
+      reserved   : total pool currently held by PyTorch allocator
+      peak_reserved: peak pool held since last reset
+    '''
+    if isinstance(device, str):
+        on_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    else:
+        on_cuda = getattr(device, "type", "") == "cuda" and torch.cuda.is_available()
+    if not on_cuda:
+        return {"alloc": 0.0, "peak_alloc": 0.0, "reserved": 0.0, "peak_reserved": 0.0}
+    mb = 1024 ** 2
+    return {
+        "alloc": torch.cuda.memory_allocated() / mb,
+        "peak_alloc": torch.cuda.max_memory_allocated() / mb,
+        "reserved": torch.cuda.memory_reserved() / mb,
+        "peak_reserved": torch.cuda.max_memory_reserved() / mb,
+    }
+
+
+@torch.no_grad()
+def _evaluate(model, loader, criterion, device) -> float:
+    model.eval()
+    total_loss = 0.0
+    n_steps = 0
+    for batch in loader:
+        batch = batch.to(device)
+        if batch.num_nodes == 0:
+            continue
+        pred = model(batch)
+        loss = criterion(pred, batch.y)
+        total_loss += float(loss.item())
+        n_steps += 1
+    model.train()
+    return total_loss / max(n_steps, 1)
+
+
+def _save_checkpoint(path: str, model, *, epoch: int, metric: float | None, extra: dict | None = None) -> None:
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "epoch": epoch,
+        "metric": metric,
+    }
+    if extra:
+        payload.update(extra)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(payload, path)
+
+
+def model_training(
+    train_dataset,
+    val_dataset=None,
+    device="cpu",
+    epochs=10,
+    learning_rate=0.01,
+    batch_size=4,
+    tensorboard_root=TENSORBOARD_ROOT,
+    checkpoint_root=CHECKPOINT_ROOT,
+):
     model = SimplePupilGNN().to(device)
-
-    # 2. Optimizer (The Coach)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # 3. Huber Loss (The Scorecard)
     # delta=1.0 means errors larger than 1 pixel are penalized linearly
     criterion = torch.nn.HuberLoss(delta=1.0)
-    
-    # Prepare DataLoader
-    loader = PyGDataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    print(f"\n--- Starting Training Test (Huber Loss) ---")
+
+    train_loader = PyGDataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = (
+        PyGDataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        if val_dataset is not None and len(val_dataset) > 0
+        else None
+    )
+
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(tensorboard_root, run_name)
+    ckpt_dir = os.path.join(checkpoint_root, run_name)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    global_step = 0
+    best_val = float("inf")
+    best_path = os.path.join(ckpt_dir, "model_best.pt")
+    last_path = os.path.join(ckpt_dir, "model_last.pt")
+
+    print(f"\n--- Starting Training (Huber Loss) ---")
+    print(f"TensorBoard log directory: {log_dir}")
+    print(f"Checkpoint directory     : {ckpt_dir}")
+    print(f"View with: tensorboard --logdir={tensorboard_root}")
+    if isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
+        print(f"CUDA device              : {torch.cuda.get_device_name(0)}")
     model.train()
 
-    loss_history = []
-    step_loss_history = []
+    on_cuda = isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available()
 
-    live_fig = None
-    live_ax = None
-    live_line = None
-    if LIVE_LOSS_PLOT:
-        plt.ion()
-        live_fig, live_ax = plt.subplots(figsize=(8, 4))
-        (live_line,) = live_ax.plot([], [], linewidth=1.5)
-        live_ax.set_xlabel("Step")
-        live_ax.set_ylabel("Huber Loss")
-        live_ax.set_title("Training Loss (per step)")
-        live_ax.grid(True, alpha=0.3)
-        live_fig.tight_layout()
-    
     for epoch in range(1, epochs + 1):
-        total_loss = 0
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{epochs}", leave=True)
+        if on_cuda:
+            torch.cuda.reset_peak_memory_stats()
+
+        total_loss = 0.0
+        n_steps = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=True)
         for batch in pbar:
             batch = batch.to(device)
             optimizer.zero_grad()
 
-            # Some windows contain no events -> empty graphs (num_nodes=0).
-            # Those can break graph-level pooling and cause pred/y shape mismatch.
             if batch.num_nodes == 0:
                 pbar.set_postfix(loss="skip(empty)")
                 continue
-            
-            # Forward pass: Generate predictions
+
             pred = model(batch)
-
-            # # If a batch contains trailing empty graphs (no nodes),
-            # # `global_mean_pool` returns fewer rows than `batch.num_graphs`.
-            # # In that case, the missing graphs are always at the end.
-            # if pred.size(0) != batch.y.size(0):
-            #     y = batch.y[: pred.size(0)]
-            # else:
-            #     y = batch.y
-
-            y = batch.y
-            
-            # Compute Huber Loss
-            # Ensure batch.y is the correct shape [batch_size, 2]
-            loss = criterion(pred, y)
-            
-            # Backward pass: Calculate gradients and update weights
+            loss = criterion(pred, batch.y)
             loss.backward()
             optimizer.step()
-            
+
             loss_val = float(loss.item())
             total_loss += loss_val
-            step_loss_history.append(loss_val)
+            n_steps += 1
 
-            # Update tqdm bar every step with current loss
-            pbar.set_postfix(loss=f"{loss_val:.4f}")
+            mem = _gpu_mem_mb(device)
+            writer.add_scalar("HuberLoss/train_step", loss_val, global_step)
+            writer.add_scalar("Graph/num_nodes", int(batch.num_nodes), global_step)
+            writer.add_scalar("Graph/num_edges", int(batch.num_edges), global_step)
+            if on_cuda:
+                writer.add_scalar("GPU/mem_alloc_MB", mem["alloc"], global_step)
+                writer.add_scalar("GPU/mem_peak_MB", mem["peak_alloc"], global_step)
+                writer.add_scalar("GPU/mem_reserved_MB", mem["reserved"], global_step)
+                writer.add_scalar("GPU/mem_peak_reserved_MB", mem["peak_reserved"], global_step)
+            global_step += 1
 
-            # Optional: live loss curve update (per step)
-            if LIVE_LOSS_PLOT and live_ax is not None and live_line is not None:
-                xs = range(1, len(step_loss_history) + 1)
-                live_line.set_data(list(xs), step_loss_history)
-                live_ax.relim()
-                live_ax.autoscale_view()
-                live_fig.canvas.draw_idle()
-                live_fig.canvas.flush_events()
-            
-        avg_loss = total_loss / len(loader)
-        loss_history.append(avg_loss)
-        print(f"Epoch {epoch:02d} | Average Huber Loss: {avg_loss:.4f}")
+            postfix = {
+                "loss": f"{loss_val:.4f}",
+                "N": int(batch.num_nodes),
+                "E": int(batch.num_edges),
+            }
+            if on_cuda:
+                postfix["gpu"] = f"{mem['alloc']:.0f}/{mem['peak_alloc']:.0f}MB"
+                postfix["rsv"] = f"{mem['peak_reserved']:.0f}MB"
+            pbar.set_postfix(postfix)
 
-    print("--- Test Run Complete ---")
+        train_avg = total_loss / max(n_steps, 1)
+        writer.add_scalar("HuberLoss/train_epoch_mean", train_avg, epoch)
+        if on_cuda:
+            epoch_peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            epoch_peak_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
+            writer.add_scalar("GPU/epoch_peak_MB", epoch_peak_alloc, epoch)
+            writer.add_scalar("GPU/epoch_peak_reserved_MB", epoch_peak_reserved, epoch)
+            print(
+                f"  GPU this epoch: peak alloc={epoch_peak_alloc:.0f} MB, "
+                f"peak reserved={epoch_peak_reserved:.0f} MB"
+            )
 
-    if LIVE_LOSS_PLOT:
-        plt.ioff()
+        if val_loader is not None:
+            val_avg = _evaluate(model, val_loader, criterion, device)
+            writer.add_scalar("HuberLoss/val_epoch_mean", val_avg, epoch)
+            print(f"Epoch {epoch:02d} | train={train_avg:.4f} | val={val_avg:.4f}")
+            if val_avg < best_val:
+                best_val = val_avg
+                _save_checkpoint(best_path, model, epoch=epoch, metric=val_avg,
+                                 extra={"selection": "best_val"})
+                print(f"  Saved best checkpoint -> {best_path} (val={val_avg:.4f})")
+        else:
+            print(f"Epoch {epoch:02d} | train={train_avg:.4f}")
 
-    if PLOT_LOSS_CURVE and len(loss_history) > 0:
-        plt.figure(figsize=(8, 4))
-        plt.plot(range(1, len(loss_history) + 1), loss_history, marker="o", linewidth=1.5)
-        plt.xlabel("Epoch")
-        plt.ylabel("Average Huber Loss")
-        plt.title("Training Loss Curve")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig("loss_curve.png", dpi=150)
-        plt.show()
+        _save_checkpoint(last_path, model, epoch=epoch,
+                         metric=val_avg if val_loader is not None else train_avg,
+                         extra={"selection": "last"})
+
+    writer.close()
+    print(f"Final weights: {last_path}")
+    if val_loader is not None and best_val != float("inf"):
+        print(f"Best val weights: {best_path} (val={best_val:.4f})")
+    return model
+
+
+def model_testing(model, test_dataset, device="cpu", batch_size=4) -> float:
+    if test_dataset is None or len(test_dataset) == 0:
+        print("No test samples available; skipping final evaluation.")
+        return float("nan")
+    loader = PyGDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    criterion = torch.nn.HuberLoss(delta=1.0)
+    loss = _evaluate(model, loader, criterion, device)
+    print(f"Test Huber loss: {loss:.4f}")
+    return loss
 
 
 # --- Main Function ---
 def main():
+    train_ds, val_ds, test_ds, info = build_3et_datasets(DATA_ROOT_3ET)
+    print(f"Train sessions: {info['train_sessions']}")
+    print(f"Val   sessions: {info['val_sessions']}")
+    print(f"Test  sessions: {info['test_sessions']}")
 
-    dataset = three_et_data_processing()
-    model_training(dataset, device=DEVICE, epochs=10, learning_rate=0.01, batch_size=4)
+    model = model_training(
+        train_ds,
+        val_dataset=val_ds,
+        device=DEVICE,
+        epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+    )
+    model_testing(model, test_ds, device=DEVICE, batch_size=BATCH_SIZE)
 
 
 if __name__ == "__main__":

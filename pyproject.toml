@@ -18,7 +18,15 @@ dependencies = [
     "torchvision==0.25.*",
     "h5py",
     "tqdm>=4.67.3",
+    "tensorboard>=2.20.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/test"]
+pythonpath = ["src"]
 
 [build-system]
 requires = ["hatchling"]

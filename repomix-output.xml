@@ -48,57 +48,251 @@ README.md
 src/gnn_ev_toolbox/__init__.py
 src/gnn_ev_toolbox/data_tools.py
 src/gnn_ev_toolbox/gnn_tools.py
+src/gnn_ev_toolbox/models.py
 src/gnn_ev_toolbox/three_et_dataloader.py
+src/test/test_three_et_dataloader.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path=".python-version">
-3.12
+<file path="src/test/test_three_et_dataloader.py">
+'''
+Pytest suite for ThreeETDataset and train/validation session splitting.
+
+Run from repo root:
+    uv run --extra dev pytest src/test/test_three_et_dataloader.py -q
+'''
+
+from __future__ import annotations
+
+import random
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import ConcatDataset
+
+from gnn_ev_toolbox.three_et_dataloader import ThreeETDataset, train_val_session_ids_split
+
+
+EVENT_DTYPE = np.dtype([("t", "uint64"), ("x", "uint64"), ("y", "uint64"), ("p", "uint64")])
+
+
+def write_label_file(path: Path, rows: list[tuple[int, int, int]]) -> None:
+    """Write label.txt in the format expected by load_labels_dataframe."""
+    lines = [f"({x},{y},{z})\n" for x, y, z in rows]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def write_session_h5(path: Path, events: np.ndarray) -> None:
+    with h5py.File(path, "w") as f:
+        f.create_dataset("events", data=events)
+
+
+def make_events_dense_times(t_values: np.ndarray, x0: int = 10, y0: int = 20) -> np.ndarray:
+    """Build structured events array with given timestamps (uint64)."""
+    n = len(t_values)
+    ev = np.empty(n, dtype=EVENT_DTYPE)
+    ev["t"] = t_values.astype(np.uint64)
+    ev["x"] = np.arange(x0, x0 + n, dtype=np.uint64)
+    ev["y"] = np.arange(y0, y0 + n, dtype=np.uint64)
+    ev["p"] = np.zeros(n, dtype=np.uint64)
+    return ev
+
+
+@pytest.fixture
+def mock_root_dense(tmp_path: Path) -> Path:
+    """
+    One train session with events in early time so several temporal windows are non-empty.
+    25 label rows -> len == 25 // 5 == 5 training steps.
+    """
+    root = tmp_path / "event_data"
+    split_dir = root / "train"
+    sid = "sess_dense"
+    sess = split_dir / sid
+    sess.mkdir(parents=True)
+
+    # For idx>=1, t_target = actual_label_idx * 10_000 >= 5000; include events from t=0..90_000
+    t_vals = np.linspace(0, 90_000, num=40, dtype=np.int64)
+    events = make_events_dense_times(t_vals)
+    write_session_h5(sess / f"{sid}.h5", events)
+
+    labels = [(100 + i, 200 + i, 0) for i in range(25)]
+    write_label_file(sess / "label.txt", labels)
+
+    return root
+
+
+@pytest.fixture
+def mock_root_empty_first_window(tmp_path: Path) -> Path:
+    """
+    All events occur after the first label windows, so idx=0 has zero events in-window.
+    """
+    root = tmp_path / "event_data"
+    split_dir = root / "train"
+    sid = "sess_empty0"
+    sess = split_dir / sid
+    sess.mkdir(parents=True)
+
+    # First windows need t < t_target for small actual_label_idx; push all t very large
+    events = make_events_dense_times(np.array([1_000_000 + i for i in range(5)], dtype=np.int64))
+    write_session_h5(sess / f"{sid}.h5", events)
+
+    labels = [(10, 20, 0)] * 15
+    write_label_file(sess / "label.txt", labels)
+
+    return root
+
+
+@pytest.fixture
+def mock_root_two_sessions(tmp_path: Path) -> tuple[Path, str, str]:
+    """Two train sessions with different label counts for ConcatDataset tests."""
+    root = tmp_path / "event_data"
+    train = root / "train"
+
+    s_a = "sess_a"
+    d_a = train / s_a
+    d_a.mkdir(parents=True)
+    t_a = np.linspace(0, 200_000, num=30, dtype=np.int64)
+    write_session_h5(d_a / f"{s_a}.h5", make_events_dense_times(t_a, x0=1, y0=2))
+    write_label_file(d_a / "label.txt", [(i, i + 1, 0) for i in range(20)])  # len ds = 20//5=4
+
+    s_b = "sess_b"
+    d_b = train / s_b
+    d_b.mkdir(parents=True)
+    t_b = np.linspace(0, 200_000, num=25, dtype=np.int64)
+    write_session_h5(d_b / f"{s_b}.h5", make_events_dense_times(t_b, x0=50, y0=60))
+    write_label_file(d_b / "label.txt", [(50 + i, 60 + i, 0) for i in range(15)])  # len = 15//5=3
+
+    return root, s_a, s_b
+
+
+class TestThreeETDatasetTensorShapes:
+    def test_index_pyg_structure_matches_huber_expectations(self, mock_root_dense: Path):
+        ds = ThreeETDataset(
+            root=str(mock_root_dense),
+            session_id="sess_dense",
+            split="train",
+            spatial_scale=0.125,
+            graph_radius=50.0,
+            temporal_subsample=5,
+            log=False,
+        )
+        assert len(ds) == 5
+        # idx=1 maps to t_target=50_000; mock events cover [0, 90_000] so the window is non-empty.
+        idx = 1
+        data = ds[idx]
+        assert data.num_nodes > 0, "fixture should yield a non-empty graph for idx=1"
+
+        assert data.x.dim() == 2
+        assert data.x.dtype == torch.float32
+        assert data.x.shape[1] == 3
+
+        assert data.edge_index.dim() == 2
+        assert data.edge_index.dtype == torch.long
+        assert data.edge_index.shape[0] == 2
+        assert data.edge_index.shape[1] == data.num_edges
+
+        assert hasattr(data, "y") and data.y is not None
+        assert data.y.dim() == 2
+        assert data.y.shape == (1, 2)
+        assert data.y.dtype == torch.float32
+
+    def test_random_index_always_valid_pyg_shapes(self, mock_root_dense: Path):
+        """Any valid index must return a consistent Data layout (empty or not)."""
+        ds = ThreeETDataset(
+            root=str(mock_root_dense),
+            session_id="sess_dense",
+            split="train",
+            spatial_scale=0.125,
+            graph_radius=50.0,
+            temporal_subsample=5,
+            log=False,
+        )
+        rng = random.Random(999)
+        for _ in range(8):
+            idx = rng.randrange(len(ds))
+            data = ds[idx]
+            assert data.x.dim() == 2 and data.x.shape[1] == 3 and data.x.dtype == torch.float32
+            assert data.edge_index.shape[0] == 2 and data.edge_index.dtype == torch.long
+            assert data.edge_index.shape[1] == data.num_edges
+            assert data.y is not None and data.y.shape == (1, 2)
+
+
+class TestEmptyGraphWindow:
+    def test_empty_window_returns_zero_nodes(self, mock_root_empty_first_window: Path):
+        ds = ThreeETDataset(
+            root=str(mock_root_empty_first_window),
+            session_id="sess_empty0",
+            split="train",
+            spatial_scale=1.0,
+            graph_radius=10.0,
+            temporal_subsample=5,
+            log=False,
+        )
+        assert len(ds) >= 1
+        data = ds[0]
+
+        assert data.num_nodes == 0
+        assert data.x.shape == (0, 3)
+        assert data.edge_index.shape == (2, 0)
+        assert data.y.shape == (1, 2)
+        assert torch.isfinite(data.y).all()
+
+
+class TestConcatDatasetLengthAndRouting:
+    def test_concat_length_and_second_session_index(self, mock_root_two_sessions: tuple[Path, str, str]):
+        root, s_a, s_b = mock_root_two_sessions
+        ds_a = ThreeETDataset(root=str(root), session_id=s_a, split="train", graph_radius=50.0, log=False)
+        ds_b = ThreeETDataset(root=str(root), session_id=s_b, split="train", graph_radius=50.0, log=False)
+
+        assert len(ds_a) == 4
+        assert len(ds_b) == 3
+
+        full = ConcatDataset([ds_a, ds_b])
+        assert len(full) == len(ds_a) + len(ds_b)
+
+        first_b = len(ds_a)
+        sample = full[first_b]
+        ref = ds_b[0]
+        assert sample.num_nodes == ref.num_nodes
+        assert torch.equal(sample.x, ref.x)
+        assert torch.equal(sample.edge_index, ref.edge_index)
+        assert torch.allclose(sample.y, ref.y)
+
+
+class TestTrainValSessionSplitNoLeakage:
+    def test_train_and_val_session_ids_are_disjoint(self):
+        sessions = [f"s{i}" for i in range(10)]
+        train_ids, val_ids = train_val_session_ids_split(
+            sessions, val_fraction=0.3, random_seed=7
+        )
+        assert set(train_ids).isdisjoint(set(val_ids))
+        assert set(train_ids) | set(val_ids) == set(sessions)
+        assert len(train_ids) >= 1 and len(val_ids) >= 1
+
+    def test_intersection_empty_for_multiple_seeds(self):
+        pool = ["alpha", "beta", "gamma", "delta"]
+        for seed in range(5):
+            tr, va = train_val_session_ids_split(pool, 0.25, random_seed=seed)
+            assert set(tr) & set(va) == set()
+
+    def test_invalid_val_fraction_raises(self):
+        with pytest.raises(ValueError):
+            train_val_session_ids_split(["a", "b"], val_fraction=0.0)
+        with pytest.raises(ValueError):
+            train_val_session_ids_split(["a", "b"], val_fraction=1.0)
+
+    def test_too_few_sessions_raises(self):
+        with pytest.raises(ValueError):
+            train_val_session_ids_split(["only_one"], val_fraction=0.2)
 </file>
 
-<file path="pyproject.toml">
-[project]
-name = "gnn-eyetracking"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.12, <3.14"
-dependencies = [
-    "matplotlib>=3.10.8",
-    "numpy>=2.4.3",
-    "pandas>=3.0.2",
-    "pyg-lib==0.6.0+pt210cu128",
-    "torch==2.10.*",
-    "torch-cluster==1.6.3+pt210cu128",
-    "torch-geometric==2.7.*",
-    "torch-scatter==2.1.2+pt210cu128",
-    "torch-sparse==0.6.18+pt210cu128",
-    "torchaudio==2.10.*",
-    "torchvision==0.25.*",
-    "h5py"
-]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/gnn_ev_toolbox"]
-
-[tool.uv]
-find-links = ["https://data.pyg.org/whl/torch-2.10.0+cu128.html"]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+<file path=".python-version">
+3.12
 </file>
 
 <file path="src/gnn_ev_toolbox/__init__.py">
@@ -241,189 +435,46 @@ class DataManager:
         return data
 </file>
 
-<file path="src/gnn_ev_toolbox/three_et_dataloader.py">
-'''
-This module is for loading the 3ET dataset
-@author: Chengyi Ma
-'''
-
-import h5py
-import pandas as pd
-import numpy as np
-import os
+<file path="src/gnn_ev_toolbox/models.py">
 import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch.nn import Linear, Sequential, ReLU, Dropout, BatchNorm1d
 
-from torch_geometric.data import Dataset, Data
-from gnn_ev_toolbox.gnn_tools import GnnBuilder
-
-class ThreeETDataLoader:
-    '''
-    ThreeETDataLoader is a class that loads the 3ET dataset
-    '''
-    def __init__(self, three_et_data_root: str, session_id: str | None = None, split: str = "train"):
-
-        split_dir = os.path.join(three_et_data_root, split)
-
-        # Temporarily only load one session of the data
-        # Get subdirectories in the split directory
-        session_list = sorted(os.listdir(split_dir))
-        print(f"Found {len(session_list)} sessions in the {split} directory")
-
-        # Choose which session to load
-        if session_id is None or session_id == "auto":
-            chosen_session_id = session_list[0]
-        else:
-            if session_id not in session_list:
-                raise FileNotFoundError(
-                    f"Session '{session_id}' not found under '{split_dir}'. "
-                    f"Example available session: '{session_list[0] if session_list else '<none>'}'"
-                )
-            chosen_session_id = session_id
-
-        self.session_id = chosen_session_id
-        self.split = split
-        self.data_df, self.labels_df = self._load_data_single_session(chosen_session_id, split_dir)
-
-
-    def _load_data_single_session(self, data_session_id:str, data_session_root:str, debug_mode:bool = True):
-        '''
-        Load a single .h5 file and corresponding label file from the 3ET dataset
-        Args:
-            data_session_id: the id of the data session
-            data_session_root: the root directory of the data session
-            debug_mode: if True, print debug information
-        Returns:
-            data_df: a pandas dataframe with the events data
-            labels_df: a pandas dataframe with the labels data
-        '''
-        if debug_mode:
-            print(f"Loading data for session {data_session_id}...")
-
-        data_path_session = os.path.join(data_session_root, data_session_id)
-        data_path_h5 = os.path.join(data_path_session, data_session_id + ".h5")
-        data_path_label = os.path.join(data_path_session, "label.txt")
-
-        data_file = h5py.File(data_path_h5, "r")
-
-        # Convert HDF5 structured dataset into a columnar DataFrame.
-        # `pd.DataFrame(data_file['events'])` can produce a single column with a structured dtype,
-        # which then breaks downstream `data_df['t']` / `['x']` access.
-        events_np = np.array(data_file["events"])
-        data_df = pd.DataFrame.from_records(events_np)
-
-        if debug_mode:
-            print(f"data file keys: {data_file.keys()}")
-            # Printing the DataFrame directly can crash when HDF5 structured dtypes
-            # contain non-numeric fields that trigger Pandas' formatting checks.
-            try:
-                events_preview = events_np[:5]
-                print(f"data file events first 5 raw rows: {events_preview}")
-            except Exception as e:
-                print(f"Could not preview raw events rows due to: {e}")
-            print(f"data_df columns: {list(data_df.columns)}")
-            print(f"data_df dtypes: {data_df.dtypes.to_dict()}")
-
-
-        t_min = data_file['events']['t'].min()
-        t_max = data_file['events']['t'].max()
-        t_range = t_max - t_min
-
-        if debug_mode:
-            print(f"Data start time: {t_min}, Data end time: {t_max}, Data range: {t_range}")
-
-
-        data_file.close()
-
-        # load label file
-        labels_df = pd.DataFrame()
-        if os.path.exists(data_path_label):
-
-            # 1. Parse the Labels with Numpy Converters
-            # The delimiter ',' splits the line into columns 0, 1, and 2.
-            # We target column 0 to strip '(' and column 2 to strip ')'
-            cleaners = {
-                0: lambda s: int(s.replace('(', '')),
-                2: lambda s: int(s.replace(')', ''))
-            }
-
-            label_date_structure = np.dtype([('x', 'int16'), ('y', 'int16'), ('z', 'int16')])
-            labels_np = np.loadtxt(
-                data_path_label, 
-                delimiter=',', 
-                converters=cleaners, 
-                dtype=label_date_structure
-            )
-
-            labels_df = pd.DataFrame(labels_np)
+class SimplePupilGNN(torch.nn.Module):
+    def __init__(self, input_dim=3, hidden_dim=64, output_dim=2):
+        super(SimplePupilGNN, self).__init__()
+        # GCN Layers (Message Passing)
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
         
-            if debug_mode:
-                print(f"Labels head 5 rows: {labels_np[:5]}")
-                print(f"Labels count: {labels_np.shape[0]}")
+        # Regression Head
+        self.mlp = Sequential(
+            Linear(hidden_dim, hidden_dim),
+            BatchNorm1d(hidden_dim),
+            ReLU(),
+            Dropout(0.5),
+            Linear(hidden_dim, output_dim),
+        )
 
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        if debug_mode:
-            print(f"Data for session {data_session_id} loaded successfully")
+        # 1. Obtain node embeddings 
+        x = self.conv1(x, edge_index)
+        x = x.relu()
+        x = self.conv2(x, edge_index)
+        x = x.relu()
+        x = self.conv3(x, edge_index)
+        x = x.relu()
 
-        return data_df, labels_df
+        # 2. Readout layer: Pool node features into a single graph-level vector
+        # This is critical for predicting one (x,y) per window
+        x = global_mean_pool(x, batch, size=data.num_graphs)
 
-class ThreeETDataset(Dataset):
-    def __init__(self, three_et_data_root, session_id, spatial_scale=0.125, 
-                 graph_radius=10.0, temporal_subsample=5):
-        super().__init__(root=three_et_data_root)
-        
-        # 1. New Parameter: temporal_subsample
-        # If 5, we turn 100Hz labels into 20Hz training steps.
-        self.temporal_subsample = temporal_subsample
-        
-        # Instantiate your loader 
-        self.session_id = session_id
-        self.loader = ThreeETDataLoader(three_et_data_root, session_id=session_id, split="train")
-        
-        self.spatial_scale = spatial_scale
-        self.builder = GnnBuilder() 
-        self.graph_radius = graph_radius
-
-    def len(self):
-        # 2. Divide total labels by subsample factor.
-        # This tells the model how many 20Hz "steps" are in the recording.
-        return len(self.loader.labels_df) // self.temporal_subsample
-
-    def get(self, idx):
-        # 3. The "Multiplier": Map 20Hz index back to 100Hz label row.
-        # Example: idx 1 becomes row 5 (50ms).
-        actual_label_idx = idx * self.temporal_subsample
-        
-        # 4. The "Anchor": Where is the target label in time?
-        t_target = actual_label_idx * 10_000 
-        
-        # 5. The "Constant Beam": Always look 100ms into the past.
-        t_start = t_target - 100_000 
-
-        # Slicing from your loader's data_df
-        all_t = self.loader.data_df['t'].values
-        start_idx = np.searchsorted(all_t, max(0, t_start))
-        end_idx = np.searchsorted(all_t, t_target)
-        window = self.loader.data_df.iloc[start_idx:end_idx]
-
-        # Process coordinates and build graph
-        coords = np.column_stack((
-            window['x'].values * self.spatial_scale, 
-            window['y'].values * self.spatial_scale, 
-            window['t'].values
-        ))
-        coords_tensor = torch.tensor(coords, dtype=torch.float32)
-
-        if coords_tensor.size(0) > 0:
-            graph = self.builder.build_radius_graph(coords_tensor, r=self.graph_radius)
-        else:
-            graph = Data(x=torch.empty((0, 3)), edge_index=torch.empty((2, 0), dtype=torch.long))
-
-        # 6. Bind the Scaled Label using the actual_label_idx
-        target_x = float(self.loader.labels_df.iloc[actual_label_idx]['x']) * self.spatial_scale
-        target_y = float(self.loader.labels_df.iloc[actual_label_idx]['y']) * self.spatial_scale
-        graph.y = torch.tensor([[target_x, target_y]], dtype=torch.float32)
-
-        return graph
+        # 3. Final regression
+        return self.mlp(x)
 </file>
 
 <file path=".gitignore">
@@ -440,6 +491,62 @@ wheels/
 
 # Data
 data
+
+# Training artifacts
+runs/
+checkpoints/
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "gnn-eyetracking"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12, <3.14"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "pandas>=3.0.2",
+    "pyg-lib==0.6.0+pt210cu128",
+    "torch==2.10.*",
+    "torch-cluster==1.6.3+pt210cu128",
+    "torch-geometric==2.7.*",
+    "torch-scatter==2.1.2+pt210cu128",
+    "torch-sparse==0.6.18+pt210cu128",
+    "torchaudio==2.10.*",
+    "torchvision==0.25.*",
+    "h5py",
+    "tqdm>=4.67.3",
+    "tensorboard>=2.20.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/test"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gnn_ev_toolbox"]
+
+[tool.uv]
+find-links = ["https://data.pyg.org/whl/torch-2.10.0+cu128.html"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 </file>
 
 <file path="README.md">
@@ -614,6 +721,289 @@ class GnnBuilder:
         plt.show()
 </file>
 
+<file path="src/gnn_ev_toolbox/three_et_dataloader.py">
+'''
+This module is for loading the 3ET dataset
+@author: Chengyi Ma
+'''
+
+import random
+import h5py
+import pandas as pd
+import numpy as np
+import os
+import torch
+
+from torch_geometric.data import Dataset, Data
+from gnn_ev_toolbox.gnn_tools import GnnBuilder
+
+
+def _resolve_session_id(split_dir: str, session_id: str) -> str:
+    session_list = sorted(os.listdir(split_dir))
+    if not session_list:
+        raise FileNotFoundError(f"No session folders found under '{split_dir}'.")
+    if session_id not in session_list:
+        preview = ", ".join(session_list[:8])
+        more = f" (+{len(session_list) - 8} more)" if len(session_list) > 8 else ""
+        raise FileNotFoundError(
+            f"Session '{session_id}' not found under '{split_dir}'. "
+            f"Available: {preview}{more}"
+        )
+    return session_id
+
+
+def train_val_session_ids_split(
+    session_ids: list[str],
+    val_fraction: float,
+    *,
+    random_seed: int = 42,
+) -> tuple[list[str], list[str]]:
+    """
+    Partition unique session IDs into disjoint train and validation lists.
+
+    Each session appears in exactly one list. Suitable for strict session-level
+    splits so that no recording leaks across train and validation.
+
+    Args:
+        session_ids: Candidate folder names (e.g. under ``train/``).
+        val_fraction: Target fraction of sessions for validation, in (0, 1).
+        random_seed: Controls shuffling before the cut.
+
+    Returns:
+        ``(train_session_ids, val_session_ids)`` with empty set intersection.
+    """
+    if not (0.0 < val_fraction < 1.0):
+        raise ValueError("val_fraction must lie in (0, 1).")
+    uniq = list(dict.fromkeys(session_ids))
+    if len(uniq) < 2:
+        raise ValueError("Need at least two distinct session IDs for a train/validation split.")
+    rng = random.Random(random_seed)
+    order = uniq.copy()
+    rng.shuffle(order)
+    n_val = max(1, int(round(len(order) * val_fraction)))
+    n_val = min(n_val, len(order) - 1)
+    val_ids = order[:n_val]
+    train_ids = order[n_val:]
+    assert not (set(train_ids) & set(val_ids))
+    return train_ids, val_ids
+
+
+def load_labels_dataframe(label_path: str) -> pd.DataFrame:
+    '''
+    Parse 3ET label.txt into a columnar DataFrame (x, y, z).
+    Returns an empty DataFrame if the file is missing.
+    '''
+    if not os.path.exists(label_path):
+        return pd.DataFrame()
+
+    cleaners = {
+        0: lambda s: int(s.replace('(', '')),
+        2: lambda s: int(s.replace(')', '')),
+    }
+    label_dtype = np.dtype([('x', 'int16'), ('y', 'int16'), ('z', 'int16')])
+    labels_np = np.loadtxt(
+        label_path,
+        delimiter=',',
+        converters=cleaners,
+        dtype=label_dtype,
+    )
+    return pd.DataFrame(labels_np)
+
+
+class ThreeETDataLoader:
+    '''
+    ThreeETDataLoader is a class that loads the 3ET dataset.
+    This class is for general purpose inspection, not for PyG training.
+    It eagerly loads one chosen session into memory.
+
+    ``session_id`` must be the folder name of one session under
+    ``<three_et_data_root>/<split>/``.
+    '''
+    def __init__(self, three_et_data_root: str, session_id: str, split: str = "train"):
+
+        split_dir = os.path.join(three_et_data_root, split)
+
+        session_list = sorted(os.listdir(split_dir))
+        print(f"Found {len(session_list)} sessions in the {split} directory")
+
+        chosen_session_id = _resolve_session_id(split_dir, session_id)
+
+        self.session_id = chosen_session_id
+        self.split = split
+        self.data_df, self.labels_df = self._load_data_single_session(chosen_session_id, split_dir)
+
+    def _load_data_single_session(
+        self, data_session_id: str, data_session_root: str, debug_mode: bool = True
+    ):
+        '''
+        Load a single .h5 file and corresponding label file from the 3ET dataset
+        Args:
+            data_session_id: the id of the data session
+            data_session_root: the root directory of the data session
+            debug_mode: if True, print debug information
+        Returns:
+            data_df: a pandas dataframe with the events data
+            labels_df: a pandas dataframe with the labels data
+        '''
+        if debug_mode:
+            print(f"Loading data for session {data_session_id}...")
+
+        data_path_session = os.path.join(data_session_root, data_session_id)
+        data_path_h5 = os.path.join(data_path_session, data_session_id + ".h5")
+        data_path_label = os.path.join(data_path_session, "label.txt")
+
+        data_file = h5py.File(data_path_h5, "r")
+
+        events_np = np.array(data_file["events"])
+        data_df = pd.DataFrame.from_records(events_np)
+
+        if debug_mode:
+            print(f"data file keys: {data_file.keys()}")
+            try:
+                events_preview = events_np[:5]
+                print(f"data file events first 5 raw rows: {events_preview}")
+            except Exception as e:
+                print(f"Could not preview raw events rows due to: {e}")
+            print(f"data_df columns: {list(data_df.columns)}")
+            print(f"data_df dtypes: {data_df.dtypes.to_dict()}")
+
+        t_min = data_file['events']['t'].min()
+        t_max = data_file['events']['t'].max()
+        t_range = t_max - t_min
+
+        if debug_mode:
+            print(f"Data start time: {t_min}, Data end time: {t_max}, Data range: {t_range}")
+
+        data_file.close()
+
+        labels_df = load_labels_dataframe(data_path_label)
+
+        if debug_mode and len(labels_df) > 0:
+            print(f"Labels head 5 rows: {labels_df.head().to_string()}")
+            print(f"Labels count: {labels_df.shape[0]}")
+
+        if debug_mode:
+            print(f"Data for session {data_session_id} loaded successfully")
+
+        return data_df, labels_df
+
+
+class ThreeETDataset(Dataset):
+    '''
+    PyTorch Geometric Dataset for 3ET+ event windows and gaze targets.
+
+    ``session_id`` must be the folder name of one session under
+    ``<root>/<split>/`` (there is no automatic session selection).
+
+    Standalone from ThreeETDataLoader: paths are resolved in ``__init__`` but
+    heavy data (events table, labels) is loaded lazily on ``len`` / ``get``
+    when first needed.
+    '''
+
+    def __init__(
+        self,
+        root: str,
+        session_id: str,
+        split: str = "train",
+        spatial_scale: float = 1.0,
+        graph_radius: float = 10.0,
+        temporal_subsample: int = 5,
+        transform=None,
+        pre_transform=None,
+        pre_filter=None,
+        log: bool = True,
+    ):
+        super().__init__(root, transform, pre_transform, pre_filter, log=log)
+        self.temporal_subsample = temporal_subsample
+        self.spatial_scale = spatial_scale
+        self.graph_radius = graph_radius
+        self.builder = GnnBuilder()
+        self.split = split
+
+        split_dir = os.path.join(self.root, split)
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(f"Split directory not found: {split_dir}")
+
+        chosen_session_id = _resolve_session_id(split_dir, session_id)
+        self.session_id = chosen_session_id
+        self._session_dir = os.path.join(split_dir, chosen_session_id)
+        self._h5_path = os.path.join(self._session_dir, f"{chosen_session_id}.h5")
+        self._label_path = os.path.join(self._session_dir, "label.txt")
+
+        if not os.path.isfile(self._h5_path):
+            raise FileNotFoundError(f"Events HDF5 not found: {self._h5_path}")
+        if not os.path.isfile(self._label_path):
+            raise FileNotFoundError(f"Labels file not found: {self._label_path}")
+
+        self._labels_df: pd.DataFrame | None = None
+        self._events_t: np.ndarray | None = None
+
+    def _ensure_labels(self) -> None:
+        if self._labels_df is not None:
+            return
+        self._labels_df = load_labels_dataframe(self._label_path)
+        if self._labels_df.empty:
+            raise ValueError(f"No labels parsed from {self._label_path}")
+
+    def _ensure_events_t(self) -> None:
+        if self._events_t is not None:
+            return
+        with h5py.File(self._h5_path, "r") as f:
+            self._events_t = np.asarray(f["events"]["t"][:], dtype=np.int64)
+
+    def len(self) -> int:
+        self._ensure_labels()
+        return len(self._labels_df) // self.temporal_subsample
+
+    def get(self, idx: int) -> Data:
+        self._ensure_labels()
+        self._ensure_events_t()
+
+        n = len(self._labels_df) // self.temporal_subsample
+        if idx < 0 or idx >= n:
+            raise IndexError(f"Index {idx} out of range for dataset of length {n}")
+
+        actual_label_idx = idx * self.temporal_subsample
+        t_target = actual_label_idx * 10_000
+        t_start = t_target - 100_000
+
+        all_t = self._events_t
+        start_idx = int(np.searchsorted(all_t, max(0, t_start)))
+        end_idx = int(np.searchsorted(all_t, t_target))
+
+        with h5py.File(self._h5_path, "r") as f:
+            ev_slice = np.asarray(f["events"][start_idx:end_idx])
+
+        if ev_slice.size == 0:
+            coords_tensor = torch.empty((0, 3), dtype=torch.float32)
+        else:
+            window = pd.DataFrame.from_records(ev_slice)
+            coords = np.column_stack(
+                (
+                    window["x"].values * self.spatial_scale,
+                    window["y"].values * self.spatial_scale,
+                    window["t"].values,
+                )
+            )
+            coords_tensor = torch.tensor(coords, dtype=torch.float32)
+
+        if coords_tensor.size(0) > 0:
+            graph = self.builder.build_radius_graph(coords_tensor, r=self.graph_radius)
+        else:
+            empty = torch.empty((0, 3), dtype=torch.float32)
+            graph = Data(
+                x=empty,
+                pos=empty,
+                edge_index=torch.empty((2, 0), dtype=torch.long),
+            )
+
+        target_x = float(self._labels_df.iloc[actual_label_idx]["x"]) * self.spatial_scale
+        target_y = float(self._labels_df.iloc[actual_label_idx]["y"]) * self.spatial_scale
+        graph.y = torch.tensor([[target_x, target_y]], dtype=torch.float32)
+
+        return graph
+</file>
+
 <file path="main.py">
 '''
 Main file for the gnn-eyetracking project
@@ -622,23 +1012,44 @@ Main file for the gnn-eyetracking project
 
 from gnn_ev_toolbox.data_tools import DataManager
 from gnn_ev_toolbox.gnn_tools import GnnBuilder
-from gnn_ev_toolbox.three_et_dataloader import ThreeETDataLoader, ThreeETDataset
+from gnn_ev_toolbox.three_et_dataloader import (
+    ThreeETDataset,
+    train_val_session_ids_split,
+)
 import torch
-import pandas as pd
 import os
+from torch.utils.data import ConcatDataset
 from torch_geometric.loader import DataLoader as PyGDataLoader
+from gnn_ev_toolbox.models import SimplePupilGNN
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 
 # --- Constants ---
 DATA_PATH = None  # Set this if you use `sample_data_processing()`.
 
-# DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data" # The path in lab machine
-DATA_ROOT_3ET = r"C:\Users\VirgilMA\Academics\Research\Data\3ET+ dataset\event_data" # The path in home machine
+DATA_ROOT_3ET = r"C:\Users\cxm3593\Academic\Workspace\Data\3ET+\3ET+ dataset\event_data" # The path in lab machine
+# DATA_ROOT_3ET = r"C:\Users\VirgilMA\Academics\Research\Data\3ET+ dataset\event_data" # The path in home machine
 
 EXAMPLE_WINDOW_SIZE = 100_000 # 100 ms
 
-VISUALIZATION_MODE = True
+VISUALIZATION_MODE = False
+TENSORBOARD_ROOT = "runs"
+CHECKPOINT_ROOT = "checkpoints"
+
+# Dataset parameters shared across every session in the concat datasets.
+SPATIAL_SCALE = 0.125
+GRAPH_RADIUS = 10.0
+TEMPORAL_SUBSAMPLE = 5
+
+VAL_FRACTION = 0.2
+SPLIT_SEED = 42
 
 # --- Global Variables ---
+LEARNING_RATE = 0.01
+BATCH_SIZE = 4
+EPOCHS = 10
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Helper Functions ---
 
@@ -676,74 +1087,233 @@ def sample_data_processing():
     print(f"\nGraph: {graph.num_nodes} nodes, {graph.num_edges} edges")
     builder.visualize_graph_3d(graph)
 
-def three_et_data_processing():
-    
-    if not os.path.isdir(DATA_ROOT_3ET):
+def _list_sessions(data_root: str, split: str) -> list[str]:
+    split_dir = os.path.join(data_root, split)
+    if not os.path.isdir(split_dir):
+        raise FileNotFoundError(f"Split directory not found: {split_dir}")
+    return sorted(
+        name for name in os.listdir(split_dir)
+        if os.path.isdir(os.path.join(split_dir, name))
+    )
+
+
+def _build_session_datasets(data_root: str, split: str, session_ids: list[str]) -> list[ThreeETDataset]:
+    datasets: list[ThreeETDataset] = []
+    for sid in session_ids:
+        datasets.append(
+            ThreeETDataset(
+                root=data_root,
+                session_id=sid,
+                split=split,
+                spatial_scale=SPATIAL_SCALE,
+                graph_radius=GRAPH_RADIUS,
+                temporal_subsample=TEMPORAL_SUBSAMPLE,
+                log=False,
+            )
+        )
+    return datasets
+
+
+def build_3et_datasets(
+    data_root: str,
+    val_fraction: float = VAL_FRACTION,
+    seed: int = SPLIT_SEED,
+) -> tuple[ConcatDataset, ConcatDataset, ConcatDataset, dict]:
+    '''
+    Enumerate every session under ``<data_root>/train`` and ``<data_root>/test``,
+    split the training sessions into train/validation by session id (no leakage),
+    and return concatenated datasets ready for a PyG DataLoader.
+
+    Returns:
+        (train_ds, val_ds, test_ds, info) where ``info`` contains the session
+        ids used for each split.
+    '''
+    if not os.path.isdir(data_root):
         raise FileNotFoundError(
-            f"3ET+ data root not found: {DATA_ROOT_3ET}\n"
+            f"3ET+ data root not found: {data_root}\n"
             "Update DATA_ROOT_3ET in main.py to point at the dataset root that contains 'train/' and 'test/'."
         )
 
-    print("--------------------------------")
-    print("3ET+ smoke test started")
-    print("--------------------------------")
+    all_train_sessions = _list_sessions(data_root, "train")
+    all_test_sessions = _list_sessions(data_root, "test")
+    print(f"Train sessions found: {len(all_train_sessions)}")
+    print(f"Test sessions found : {len(all_test_sessions)}")
 
-    # Minimal: ensure the raw loader works.
-    loader = ThreeETDataLoader(three_et_data_root=DATA_ROOT_3ET)
-    print(f"Events DF shape: {loader.data_df.shape}")
-    print(f"Labels DF shape: {loader.labels_df.shape}")
-
-    # Minimal: ensure the PyG dataset builds at least one graph.
-    dataset = ThreeETDataset(
-        three_et_data_root=DATA_ROOT_3ET,
-        session_id="auto",
-        spatial_scale=0.125,
-        graph_radius=10.0,
-        temporal_subsample=5,
+    train_sessions, val_sessions = train_val_session_ids_split(
+        all_train_sessions, val_fraction=val_fraction, random_seed=seed
     )
-    print(f"Dataset length (steps): {len(dataset)}")
-
-    # --- Visualization for testing ---
-    if VISUALIZATION_MODE:
-        # Find a non-empty sample (early indices can be empty depending on label time).
-        sample = None
-        sample_idx = None
-        for i in range(min(len(dataset), 50)):
-            g = dataset[i]
-            if g.num_nodes > 0:
-                sample = g
-                sample_idx = i
-                break
-
-        if sample is None:
-            sample = dataset[0]
-            sample_idx = 0
-
-        print(
-            f"Sample graph (idx={sample_idx}): "
-            f"nodes={sample.num_nodes}, edges={sample.num_edges}, "
-            f"x_shape={tuple(sample.x.shape)}, y_shape={tuple(sample.y.shape)}"
-        )
-
-        # Visualize the sample graph (3D).
-        if sample.num_nodes > 0 and sample.num_edges > 0:
-            GnnBuilder().visualize_graph_3d(sample, title=f"3ET+ sample graph (idx={sample_idx})")
-
-    #--- Visualization end ---
-
-    # Optional: verify batching works (no plotting).
-    dl = PyGDataLoader(dataset, batch_size=2, shuffle=False)
-    batch = next(iter(dl))
     print(
-        "Batch graph: "
-        f"graphs={batch.num_graphs}, nodes={batch.num_nodes}, edges={batch.num_edges}, "
-        f"x_shape={tuple(batch.x.shape)}, y_shape={tuple(batch.y.shape)}"
+        f"Split train/val by session: {len(train_sessions)} train / "
+        f"{len(val_sessions)} val (seed={seed}, val_fraction={val_fraction})"
     )
+
+    train_list = _build_session_datasets(data_root, "train", train_sessions)
+    val_list = _build_session_datasets(data_root, "train", val_sessions)
+    test_list = _build_session_datasets(data_root, "test", all_test_sessions)
+
+    train_ds = ConcatDataset(train_list)
+    val_ds = ConcatDataset(val_list)
+    test_ds = ConcatDataset(test_list)
+
+    print(
+        f"Concat sizes (steps): train={len(train_ds)}, val={len(val_ds)}, "
+        f"test={len(test_ds)}"
+    )
+
+    info = {
+        "train_sessions": train_sessions,
+        "val_sessions": val_sessions,
+        "test_sessions": all_test_sessions,
+    }
+    return train_ds, val_ds, test_ds, info
+
+
+@torch.no_grad()
+def _evaluate(model, loader, criterion, device) -> float:
+    model.eval()
+    total_loss = 0.0
+    n_steps = 0
+    for batch in loader:
+        batch = batch.to(device)
+        if batch.num_nodes == 0:
+            continue
+        pred = model(batch)
+        loss = criterion(pred, batch.y)
+        total_loss += float(loss.item())
+        n_steps += 1
+    model.train()
+    return total_loss / max(n_steps, 1)
+
+
+def _save_checkpoint(path: str, model, *, epoch: int, metric: float | None, extra: dict | None = None) -> None:
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "epoch": epoch,
+        "metric": metric,
+    }
+    if extra:
+        payload.update(extra)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(payload, path)
+
+
+def model_training(
+    train_dataset,
+    val_dataset=None,
+    device="cpu",
+    epochs=10,
+    learning_rate=0.01,
+    batch_size=4,
+    tensorboard_root=TENSORBOARD_ROOT,
+    checkpoint_root=CHECKPOINT_ROOT,
+):
+    model = SimplePupilGNN().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # delta=1.0 means errors larger than 1 pixel are penalized linearly
+    criterion = torch.nn.HuberLoss(delta=1.0)
+
+    train_loader = PyGDataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = (
+        PyGDataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        if val_dataset is not None and len(val_dataset) > 0
+        else None
+    )
+
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(tensorboard_root, run_name)
+    ckpt_dir = os.path.join(checkpoint_root, run_name)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    global_step = 0
+    best_val = float("inf")
+    best_path = os.path.join(ckpt_dir, "model_best.pt")
+    last_path = os.path.join(ckpt_dir, "model_last.pt")
+
+    print(f"\n--- Starting Training (Huber Loss) ---")
+    print(f"TensorBoard log directory: {log_dir}")
+    print(f"Checkpoint directory     : {ckpt_dir}")
+    print(f"View with: tensorboard --logdir={tensorboard_root}")
+    model.train()
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        n_steps = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=True)
+        for batch in pbar:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+
+            if batch.num_nodes == 0:
+                pbar.set_postfix(loss="skip(empty)")
+                continue
+
+            pred = model(batch)
+            loss = criterion(pred, batch.y)
+            loss.backward()
+            optimizer.step()
+
+            loss_val = float(loss.item())
+            total_loss += loss_val
+            n_steps += 1
+            writer.add_scalar("HuberLoss/train_step", loss_val, global_step)
+            global_step += 1
+
+            pbar.set_postfix(loss=f"{loss_val:.4f}")
+
+        train_avg = total_loss / max(n_steps, 1)
+        writer.add_scalar("HuberLoss/train_epoch_mean", train_avg, epoch)
+
+        if val_loader is not None:
+            val_avg = _evaluate(model, val_loader, criterion, device)
+            writer.add_scalar("HuberLoss/val_epoch_mean", val_avg, epoch)
+            print(f"Epoch {epoch:02d} | train={train_avg:.4f} | val={val_avg:.4f}")
+            if val_avg < best_val:
+                best_val = val_avg
+                _save_checkpoint(best_path, model, epoch=epoch, metric=val_avg,
+                                 extra={"selection": "best_val"})
+                print(f"  Saved best checkpoint -> {best_path} (val={val_avg:.4f})")
+        else:
+            print(f"Epoch {epoch:02d} | train={train_avg:.4f}")
+
+        _save_checkpoint(last_path, model, epoch=epoch,
+                         metric=val_avg if val_loader is not None else train_avg,
+                         extra={"selection": "last"})
+
+    writer.close()
+    print(f"Final weights: {last_path}")
+    if val_loader is not None and best_val != float("inf"):
+        print(f"Best val weights: {best_path} (val={best_val:.4f})")
+    return model
+
+
+def model_testing(model, test_dataset, device="cpu", batch_size=4) -> float:
+    if test_dataset is None or len(test_dataset) == 0:
+        print("No test samples available; skipping final evaluation.")
+        return float("nan")
+    loader = PyGDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    criterion = torch.nn.HuberLoss(delta=1.0)
+    loss = _evaluate(model, loader, criterion, device)
+    print(f"Test Huber loss: {loss:.4f}")
+    return loss
+
 
 # --- Main Function ---
 def main():
+    train_ds, val_ds, test_ds, info = build_3et_datasets(DATA_ROOT_3ET)
+    print(f"Train sessions: {info['train_sessions']}")
+    print(f"Val   sessions: {info['val_sessions']}")
+    print(f"Test  sessions: {info['test_sessions']}")
 
-    three_et_data_processing()
+    model = model_training(
+        train_ds,
+        val_dataset=val_ds,
+        device=DEVICE,
+        epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+    )
+    model_testing(model, test_ds, device=DEVICE, batch_size=BATCH_SIZE)
 
 
 if __name__ == "__main__":
