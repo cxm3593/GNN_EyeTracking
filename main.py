@@ -35,15 +35,17 @@ SPATIAL_SCALE = 1.0
 GRAPH_RADIUS = 10.0
 TEMPORAL_SUBSAMPLE = 5
 MAX_NUM_NEIGHBORS = 8  # Hard cap on edges per node (radius_graph). Lower = less GPU memory.
+LABEL_NORMALIZATION = "minmax01"  # None | "zscore" | "minmax01"
 
 VAL_FRACTION = 0.2
 SPLIT_SEED = 42
 
 # --- Global Variables ---
 LEARNING_RATE = 0.01
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 EPOCHS = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+HUBER_DELTA = 0.02 if LABEL_NORMALIZATION is not None else 1.0  # in label units
 
 # --- Helper Functions ---
 
@@ -100,6 +102,7 @@ def _build_session_datasets(data_root: str, split: str, session_ids: list[str]) 
                 session_id=sid,
                 split=split,
                 spatial_scale=SPATIAL_SCALE,
+                label_normalization=LABEL_NORMALIZATION,
                 graph_radius=GRAPH_RADIUS,
                 temporal_subsample=TEMPORAL_SUBSAMPLE,
                 max_num_neighbors=MAX_NUM_NEIGHBORS,
@@ -228,8 +231,8 @@ def model_training(
 ):
     model = SimplePupilGNN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # delta=1.0 means errors larger than 1 pixel are penalized linearly
-    criterion = torch.nn.HuberLoss(delta=1.0)
+    # delta is in the same units as graph.y (normalized units if LABEL_NORMALIZATION != None)
+    criterion = torch.nn.HuberLoss(delta=HUBER_DELTA)
 
     train_loader = PyGDataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = (
@@ -344,7 +347,7 @@ def model_testing(model, test_dataset, device="cpu", batch_size=4) -> float:
         print("No test samples available; skipping final evaluation.")
         return float("nan")
     loader = PyGDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    criterion = torch.nn.HuberLoss(delta=1.0)
+    criterion = torch.nn.HuberLoss(delta=HUBER_DELTA)
     loss = _evaluate(model, loader, criterion, device)
     print(f"Test Huber loss: {loss:.4f}")
     return loss

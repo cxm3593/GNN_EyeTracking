@@ -182,6 +182,7 @@ class ThreeETDataset(Dataset):
         session_id: str,
         split: str = "train",
         spatial_scale: float = 1.0,
+        label_normalization: str | None = None,
         graph_radius: float = 10.0,
         temporal_subsample: int = 5,
         max_num_neighbors: int = 32,
@@ -197,6 +198,7 @@ class ThreeETDataset(Dataset):
         self.max_num_neighbors = max_num_neighbors
         self.builder = GnnBuilder()
         self.split = split
+        self.label_normalization = label_normalization  # None | "zscore" | "minmax01"
 
         split_dir = os.path.join(self.root, split)
         if not os.path.isdir(split_dir):
@@ -215,6 +217,8 @@ class ThreeETDataset(Dataset):
 
         self._labels_df: pd.DataFrame | None = None
         self._events_t: np.ndarray | None = None
+        self._label_center: np.ndarray | None = None  # shape (2,)
+        self._label_scale: np.ndarray | None = None   # shape (2,)
 
     def _ensure_labels(self) -> None:
         if self._labels_df is not None:
@@ -222,6 +226,37 @@ class ThreeETDataset(Dataset):
         self._labels_df = load_labels_dataframe(self._label_path)
         if self._labels_df.empty:
             raise ValueError(f"No labels parsed from {self._label_path}")
+
+        if self.label_normalization is None:
+            self._label_center = np.array([0.0, 0.0], dtype=np.float32)
+            self._label_scale = np.array([1.0, 1.0], dtype=np.float32)
+            return
+
+        x = self._labels_df["x"].to_numpy(dtype=np.float32) * self.spatial_scale
+        y = self._labels_df["y"].to_numpy(dtype=np.float32) * self.spatial_scale
+
+        if self.label_normalization == "zscore":
+            cx, cy = float(np.mean(x)), float(np.mean(y))
+            sx, sy = float(np.std(x)), float(np.std(y))
+            sx = sx if sx > 1e-6 else 1.0
+            sy = sy if sy > 1e-6 else 1.0
+            self._label_center = np.array([cx, cy], dtype=np.float32)
+            self._label_scale = np.array([sx, sy], dtype=np.float32)
+            return
+
+        if self.label_normalization == "minmax01":
+            xmin, xmax = float(np.min(x)), float(np.max(x))
+            ymin, ymax = float(np.min(y)), float(np.max(y))
+            sx = (xmax - xmin) if (xmax - xmin) > 1e-6 else 1.0
+            sy = (ymax - ymin) if (ymax - ymin) > 1e-6 else 1.0
+            self._label_center = np.array([xmin, ymin], dtype=np.float32)
+            self._label_scale = np.array([sx, sy], dtype=np.float32)
+            return
+
+        raise ValueError(
+            f"Unknown label_normalization='{self.label_normalization}'. "
+            "Use None, 'zscore', or 'minmax01'."
+        )
 
     def _ensure_events_t(self) -> None:
         if self._events_t is not None:
@@ -281,6 +316,13 @@ class ThreeETDataset(Dataset):
 
         target_x = float(self._labels_df.iloc[actual_label_idx]["x"]) * self.spatial_scale
         target_y = float(self._labels_df.iloc[actual_label_idx]["y"]) * self.spatial_scale
-        graph.y = torch.tensor([[target_x, target_y]], dtype=torch.float32)
+        y_raw = torch.tensor([[target_x, target_y]], dtype=torch.float32)
+        graph.y_raw = y_raw
+
+        center = self._label_center if self._label_center is not None else np.array([0.0, 0.0], dtype=np.float32)
+        scale = self._label_scale if self._label_scale is not None else np.array([1.0, 1.0], dtype=np.float32)
+        graph.y = (y_raw - torch.tensor(center).view(1, 2)) / torch.tensor(scale).view(1, 2)
+        graph.y_center = torch.tensor(center).view(1, 2)
+        graph.y_scale = torch.tensor(scale).view(1, 2)
 
         return graph
