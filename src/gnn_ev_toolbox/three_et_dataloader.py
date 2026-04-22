@@ -50,7 +50,7 @@ def train_val_session_ids_split(
     """
     if not (0.0 < val_fraction < 1.0):
         raise ValueError("val_fraction must lie in (0, 1).")
-    uniq = list(dict.fromkeys(session_ids))
+    uniq = list[str](dict.fromkeys(session_ids))
     if len(uniq) < 2:
         raise ValueError("Need at least two distinct session IDs for a train/validation split.")
     rng = random.Random(random_seed)
@@ -183,6 +183,9 @@ class ThreeETDataset(Dataset):
         split: str = "train",
         spatial_scale: float = 1.0,
         label_normalization: str | None = None,
+        resolution_width: int | None = None,
+        resolution_height: int | None = None,
+        time_to_pixel_us: float | None = None,
         graph_radius: float = 10.0,
         temporal_subsample: int = 5,
         max_num_neighbors: int = 32,
@@ -198,7 +201,19 @@ class ThreeETDataset(Dataset):
         self.max_num_neighbors = max_num_neighbors
         self.builder = GnnBuilder()
         self.split = split
-        self.label_normalization = label_normalization  # None | "zscore" | "minmax01"
+        self.label_normalization = label_normalization  # None | "zscore" | "minmax01" | "resolution"
+        self.resolution_width = resolution_width
+        self.resolution_height = resolution_height
+        # time_to_pixel_us rescales event timestamps so that 1 unit of time == 1 pixel
+        # of space in the graph coordinate system. None => keep raw microseconds.
+        self.time_to_pixel_us = time_to_pixel_us
+
+        if label_normalization == "resolution":
+            if resolution_width is None or resolution_height is None:
+                raise ValueError(
+                    "label_normalization='resolution' requires resolution_width and "
+                    "resolution_height to be set."
+                )
 
         split_dir = os.path.join(self.root, split)
         if not os.path.isdir(split_dir):
@@ -253,9 +268,20 @@ class ThreeETDataset(Dataset):
             self._label_scale = np.array([sx, sy], dtype=np.float32)
             return
 
+        if self.label_normalization == "resolution":
+            # Deterministic normalization to [0, 1] based on sensor resolution.
+            # Independent of the label distribution, so it is consistent across
+            # every split and every session.
+            self._label_center = np.array([0.0, 0.0], dtype=np.float32)
+            self._label_scale = np.array(
+                [float(self.resolution_width), float(self.resolution_height)],
+                dtype=np.float32,
+            )
+            return
+
         raise ValueError(
             f"Unknown label_normalization='{self.label_normalization}'. "
-            "Use None, 'zscore', or 'minmax01'."
+            "Use None, 'zscore', 'minmax01', or 'resolution'."
         )
 
     def _ensure_events_t(self) -> None:
@@ -291,11 +317,20 @@ class ThreeETDataset(Dataset):
             coords_tensor = torch.empty((0, 3), dtype=torch.float32)
         else:
             window = pd.DataFrame.from_records(ev_slice)
+            # Shift time so every graph starts at 0, then (optionally) rescale so
+            # 1 unit of time == 1 pixel of space, making `graph_radius` consistent
+            # across the x/y/t axes.
+            t_window_ref = max(0, t_start)
+            t_rel_us = window["t"].values.astype(np.float64) - float(t_window_ref)
+            if self.time_to_pixel_us is not None:
+                t_scaled = t_rel_us / float(self.time_to_pixel_us)
+            else:
+                t_scaled = t_rel_us
             coords = np.column_stack(
                 (
                     window["x"].values * self.spatial_scale,
                     window["y"].values * self.spatial_scale,
-                    window["t"].values,
+                    t_scaled,
                 )
             )
             coords_tensor = torch.tensor(coords, dtype=torch.float32)

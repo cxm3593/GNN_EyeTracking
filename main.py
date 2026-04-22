@@ -32,20 +32,35 @@ CHECKPOINT_ROOT = "checkpoints"
 
 # Dataset parameters shared across every session in the concat datasets.
 SPATIAL_SCALE = 1.0
-GRAPH_RADIUS = 10.0
+GRAPH_RADIUS = 5.0
 TEMPORAL_SUBSAMPLE = 5
 MAX_NUM_NEIGHBORS = 8  # Hard cap on edges per node (radius_graph). Lower = less GPU memory.
-LABEL_NORMALIZATION = "minmax01"  # None | "zscore" | "minmax01"
+LABEL_NORMALIZATION = "resolution"  # None | "zscore" | "minmax01" | "resolution"
+SPATIAL_RESOLUTION_WIDTH = 640
+SPATIAL_RESOLUTION_HEIGHT = 480
+
+# Time unit for graph coordinates: µs per 1 pixel of space.
+# A value here rescales t so that `graph_radius` has the same meaning on x/y/t.
+# Set to None to keep raw µs.
+TIME_TO_PIXEL_US: float | None = 30.0
 
 VAL_FRACTION = 0.2
 SPLIT_SEED = 42
 
+
 # --- Global Variables ---
-LEARNING_RATE = 0.01
-BATCH_SIZE = 4
-EPOCHS = 10
+RUN_NOTE = "SAGEConv_TempSubsample5_TimeToPixel30_Radius5_HuberDelta0.05"
+
+LEARNING_RATE = 1e-3
+BATCH_SIZE = 2
+EPOCHS = 100
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-HUBER_DELTA = 0.02 if LABEL_NORMALIZATION is not None else 1.0  # in label units
+# Huber delta in label units. With "resolution" normalization, labels are in [0, 1]
+# so delta=0.05 corresponds to ~5% of the sensor (roughly 25-30 px), a reasonable
+# threshold between the quadratic (small, precise) and linear (outlier-robust) regimes.
+HUBER_DELTA = 0.05 if LABEL_NORMALIZATION is not None else 5.0
+
+SPATIAL_TEMPORAL_RATIO = 1.0 # The ratio of spatial data and temporal data, by default 1px = 1us. 
 
 # --- Helper Functions ---
 
@@ -93,7 +108,12 @@ def _list_sessions(data_root: str, split: str) -> list[str]:
     )
 
 
-def _build_session_datasets(data_root: str, split: str, session_ids: list[str]) -> list[ThreeETDataset]:
+def _build_session_datasets(
+    data_root: str,
+    split: str,
+    session_ids: list[str],
+    time_to_pixel_us: float | None,
+) -> list[ThreeETDataset]:
     datasets: list[ThreeETDataset] = []
     for sid in session_ids:
         datasets.append(
@@ -103,6 +123,9 @@ def _build_session_datasets(data_root: str, split: str, session_ids: list[str]) 
                 split=split,
                 spatial_scale=SPATIAL_SCALE,
                 label_normalization=LABEL_NORMALIZATION,
+                resolution_width=SPATIAL_RESOLUTION_WIDTH,
+                resolution_height=SPATIAL_RESOLUTION_HEIGHT,
+                time_to_pixel_us=time_to_pixel_us,
                 graph_radius=GRAPH_RADIUS,
                 temporal_subsample=TEMPORAL_SUBSAMPLE,
                 max_num_neighbors=MAX_NUM_NEIGHBORS,
@@ -145,9 +168,14 @@ def build_3et_datasets(
         f"{len(val_sessions)} val (seed={seed}, val_fraction={val_fraction})"
     )
 
-    train_list = _build_session_datasets(data_root, "train", train_sessions)
-    val_list = _build_session_datasets(data_root, "train", val_sessions)
-    test_list = _build_session_datasets(data_root, "test", all_test_sessions)
+    print(
+        f"Graph t-scaling: time_to_pixel_us="
+        f"{'raw µs' if TIME_TO_PIXEL_US is None else f'{float(TIME_TO_PIXEL_US):.2f} µs/px'}"
+    )
+
+    train_list = _build_session_datasets(data_root, "train", train_sessions, TIME_TO_PIXEL_US)
+    val_list = _build_session_datasets(data_root, "train", val_sessions, TIME_TO_PIXEL_US)
+    test_list = _build_session_datasets(data_root, "test", all_test_sessions, TIME_TO_PIXEL_US)
 
     train_ds = ConcatDataset(train_list)
     val_ds = ConcatDataset(val_list)
@@ -190,11 +218,34 @@ def _gpu_mem_mb(device) -> dict[str, float]:
     }
 
 
+def _pixel_errors(pred: torch.Tensor, batch) -> tuple[torch.Tensor, torch.Tensor]:
+    '''
+    Denormalize predictions and targets back to pixel units and return:
+        (per-sample MAE over x,y coords, per-sample Euclidean distance)
+    Both tensors have shape [B].
+    '''
+    pred_px = pred * batch.y_scale + batch.y_center          # [B, 2]
+    y_px = batch.y_raw                                       # [B, 2]
+    abs_err = (pred_px - y_px).abs()                         # [B, 2]
+    mae_per_sample = abs_err.mean(dim=1)                     # [B]
+    l2_per_sample = torch.linalg.norm(pred_px - y_px, dim=1) # [B]
+    return mae_per_sample, l2_per_sample
+
+
 @torch.no_grad()
-def _evaluate(model, loader, criterion, device) -> float:
+def _evaluate(model, loader, criterion, device) -> dict[str, float]:
+    '''
+    Returns a dict with:
+        loss     : mean Huber loss in normalized units (what we optimize)
+        mae_px   : mean absolute error per coordinate, in pixels
+        l2_px    : mean Euclidean distance between prediction and target, in pixels
+    '''
     model.eval()
     total_loss = 0.0
     n_steps = 0
+    sum_mae_px = 0.0
+    sum_l2_px = 0.0
+    n_samples = 0
     for batch in loader:
         batch = batch.to(device)
         if batch.num_nodes == 0:
@@ -203,8 +254,17 @@ def _evaluate(model, loader, criterion, device) -> float:
         loss = criterion(pred, batch.y)
         total_loss += float(loss.item())
         n_steps += 1
+
+        mae_per_sample, l2_per_sample = _pixel_errors(pred, batch)
+        sum_mae_px += float(mae_per_sample.sum().item())
+        sum_l2_px += float(l2_per_sample.sum().item())
+        n_samples += int(mae_per_sample.numel())
     model.train()
-    return total_loss / max(n_steps, 1)
+    return {
+        "loss": total_loss / max(n_steps, 1),
+        "mae_px": sum_mae_px / max(n_samples, 1),
+        "l2_px": sum_l2_px / max(n_samples, 1),
+    }
 
 
 def _save_checkpoint(path: str, model, *, epoch: int, metric: float | None, extra: dict | None = None) -> None:
@@ -242,6 +302,9 @@ def model_training(
     )
 
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{RUN_NOTE}_{run_name}_LR{learning_rate}_BS{batch_size}_E{epochs}"
+
+    
     log_dir = os.path.join(tensorboard_root, run_name)
     ckpt_dir = os.path.join(checkpoint_root, run_name)
     os.makedirs(log_dir, exist_ok=True)
@@ -268,6 +331,9 @@ def model_training(
 
         total_loss = 0.0
         n_steps = 0
+        sum_mae_px = 0.0
+        sum_l2_px = 0.0
+        n_samples = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=True)
         for batch in pbar:
             batch = batch.to(device)
@@ -286,8 +352,18 @@ def model_training(
             total_loss += loss_val
             n_steps += 1
 
+            with torch.no_grad():
+                mae_per_sample, l2_per_sample = _pixel_errors(pred, batch)
+                batch_mae_px = float(mae_per_sample.mean().item())
+                batch_l2_px = float(l2_per_sample.mean().item())
+                sum_mae_px += float(mae_per_sample.sum().item())
+                sum_l2_px += float(l2_per_sample.sum().item())
+                n_samples += int(mae_per_sample.numel())
+
             mem = _gpu_mem_mb(device)
             writer.add_scalar("HuberLoss/train_step", loss_val, global_step)
+            writer.add_scalar("PixelMAE/train_step", batch_mae_px, global_step)
+            writer.add_scalar("PixelL2/train_step", batch_l2_px, global_step)
             writer.add_scalar("Graph/num_nodes", int(batch.num_nodes), global_step)
             writer.add_scalar("Graph/num_edges", int(batch.num_edges), global_step)
             if on_cuda:
@@ -299,6 +375,8 @@ def model_training(
 
             postfix = {
                 "loss": f"{loss_val:.4f}",
+                "mae_px": f"{batch_mae_px:.2f}",
+                "l2_px": f"{batch_l2_px:.2f}",
                 "N": int(batch.num_nodes),
                 "E": int(batch.num_edges),
             }
@@ -308,7 +386,11 @@ def model_training(
             pbar.set_postfix(postfix)
 
         train_avg = total_loss / max(n_steps, 1)
+        train_mae_px = sum_mae_px / max(n_samples, 1)
+        train_l2_px = sum_l2_px / max(n_samples, 1)
         writer.add_scalar("HuberLoss/train_epoch_mean", train_avg, epoch)
+        writer.add_scalar("PixelMAE/train_epoch_mean", train_mae_px, epoch)
+        writer.add_scalar("PixelL2/train_epoch_mean", train_l2_px, epoch)
         if on_cuda:
             epoch_peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 2)
             epoch_peak_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
@@ -320,37 +402,52 @@ def model_training(
             )
 
         if val_loader is not None:
-            val_avg = _evaluate(model, val_loader, criterion, device)
-            writer.add_scalar("HuberLoss/val_epoch_mean", val_avg, epoch)
-            print(f"Epoch {epoch:02d} | train={train_avg:.4f} | val={val_avg:.4f}")
-            if val_avg < best_val:
-                best_val = val_avg
-                _save_checkpoint(best_path, model, epoch=epoch, metric=val_avg,
+            val_metrics = _evaluate(model, val_loader, criterion, device)
+            val_loss = val_metrics["loss"]
+            writer.add_scalar("HuberLoss/val_epoch_mean", val_loss, epoch)
+            writer.add_scalar("PixelMAE/val_epoch_mean", val_metrics["mae_px"], epoch)
+            writer.add_scalar("PixelL2/val_epoch_mean", val_metrics["l2_px"], epoch)
+            print(
+                f"Epoch {epoch:02d} | "
+                f"train loss={train_avg:.4f} mae={train_mae_px:.2f}px l2={train_l2_px:.2f}px | "
+                f"val loss={val_loss:.4f} mae={val_metrics['mae_px']:.2f}px "
+                f"l2={val_metrics['l2_px']:.2f}px"
+            )
+            if val_loss < best_val:
+                best_val = val_loss
+                _save_checkpoint(best_path, model, epoch=epoch, metric=val_loss,
                                  extra={"selection": "best_val"})
-                print(f"  Saved best checkpoint -> {best_path} (val={val_avg:.4f})")
+                print(f"  Saved best checkpoint -> {best_path} (val loss={val_loss:.4f})")
         else:
-            print(f"Epoch {epoch:02d} | train={train_avg:.4f}")
+            print(
+                f"Epoch {epoch:02d} | "
+                f"train loss={train_avg:.4f} mae={train_mae_px:.2f}px l2={train_l2_px:.2f}px"
+            )
 
         _save_checkpoint(last_path, model, epoch=epoch,
-                         metric=val_avg if val_loader is not None else train_avg,
+                         metric=val_loss if val_loader is not None else train_avg,
                          extra={"selection": "last"})
 
     writer.close()
     print(f"Final weights: {last_path}")
     if val_loader is not None and best_val != float("inf"):
-        print(f"Best val weights: {best_path} (val={best_val:.4f})")
+        print(f"Best val weights: {best_path} (val loss={best_val:.4f})")
     return model
 
 
-def model_testing(model, test_dataset, device="cpu", batch_size=4) -> float:
+def model_testing(model, test_dataset, device="cpu", batch_size=4) -> dict[str, float]:
     if test_dataset is None or len(test_dataset) == 0:
         print("No test samples available; skipping final evaluation.")
-        return float("nan")
+        return {"loss": float("nan"), "mae_px": float("nan"), "l2_px": float("nan")}
     loader = PyGDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     criterion = torch.nn.HuberLoss(delta=HUBER_DELTA)
-    loss = _evaluate(model, loader, criterion, device)
-    print(f"Test Huber loss: {loss:.4f}")
-    return loss
+    metrics = _evaluate(model, loader, criterion, device)
+    print(
+        f"Test | Huber loss={metrics['loss']:.4f} | "
+        f"pixel MAE={metrics['mae_px']:.2f}px | "
+        f"pixel L2={metrics['l2_px']:.2f}px"
+    )
+    return metrics
 
 
 # --- Main Function ---
