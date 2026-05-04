@@ -32,7 +32,7 @@ CHECKPOINT_ROOT = "checkpoints"
 
 # Dataset parameters shared across every session in the concat datasets.
 SPATIAL_SCALE = 1.0
-GRAPH_RADIUS = 5.0
+GRAPH_RADIUS = 10.0
 TEMPORAL_SUBSAMPLE = 5
 MAX_NUM_NEIGHBORS = 8  # Hard cap on edges per node (radius_graph). Lower = less GPU memory.
 LABEL_NORMALIZATION = "resolution"  # None | "zscore" | "minmax01" | "resolution"
@@ -41,7 +41,7 @@ SPATIAL_RESOLUTION_HEIGHT = 480
 
 # Time unit for graph coordinates: µs per 1 pixel of space.
 # A value here rescales t so that `graph_radius` has the same meaning on x/y/t.
-# Set to None to keep raw µs.
+# Set to None to keTIME_TO_PIXEL_USep raw µs.
 TIME_TO_PIXEL_US: float | None = 30.0
 
 # Window of events (in µs) feeding each prediction; matches the hardcoded value
@@ -53,12 +53,24 @@ WINDOW_US = 100_000
 # all three input channels in roughly [0, 1] for stable optimization.
 NORMALIZE_INPUT = True
 
+# When True, append polarity as a 4th node feature on data.x (mapped {0, 1} -> {-1, +1}).
+# data.pos stays 3D (xyt) so any future edge-geometry features stay clean.
+INCLUDE_POLARITY = True
+
+# Train-only random translation augmentation. Each train window's events AND its
+# pupil-center label are jointly shifted by (dx, dy) ~ Uniform(-T, T) raw pixels.
+# Targets generalization, not capacity: same local pattern, different absolute
+# sensor coordinates -> the model can't lean on subject-specific position priors.
+AUGMENT_TRANSLATE = True
+TRANSLATE_MAX_PX = 50.0
+AUGMENT_SEED = 12345  # Reproducibility for the dx/dy stream across runs.
+
 VAL_FRACTION = 0.2
 SPLIT_SEED = 42
 
 
 # --- Global Variables ---
-RUN_NOTE = "normalized_input;LayerNorm;early_stop(SAGE_LN_InputNorm_TempSubsample5_TimeToPixel30_Radius5_HuberDelta0.05)"
+RUN_NOTE = "step3;translate50;convdrop0.1(SAGE_LN_InputNorm_Polarity_Radius10_K8_TempSubsample5_TimeToPixel30_HuberDelta0.05)"
 
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 2
@@ -69,13 +81,21 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # threshold between the quadratic (small, precise) and linear (outlier-robust) regimes.
 HUBER_DELTA = 0.05 if LABEL_NORMALIZATION is not None else 5.0
 
+# Number of input channels into the GNN: 3 (x, y, t) or 4 (+ polarity). Derived
+# from INCLUDE_POLARITY so the model and dataset stay in sync.
+GNN_INPUT_DIM = 4 if INCLUDE_POLARITY else 3
+
+# Per-node dropout applied after each conv -> norm -> relu block in the encoder.
+# Mild regularization on the encoder side; 0.0 disables it.
+CONV_DROPOUT = 0.1
+
 # Early-stopping: halt training when validation loss has not improved by at least
 # EARLY_STOP_MIN_DELTA for EARLY_STOP_PATIENCE consecutive epochs. Saves wall-clock
 # time without changing the trained model's quality (best checkpoint is unchanged).
-EARLY_STOP_PATIENCE = 10
-EARLY_STOP_MIN_DELTA = 1e-4
-
-SPATIAL_TEMPORAL_RATIO = 1.0 # The ratio of spatial data and temporal data, by default 1px = 1us. 
+# Loosened in step 2: previous (10, 1e-4) cut runs short before the slow late-epoch
+# val improvement we saw in the baseline could materialize.
+EARLY_STOP_PATIENCE = 20
+EARLY_STOP_MIN_DELTA = 0.0
 
 # --- Helper Functions ---
 
@@ -128,9 +148,32 @@ def _build_session_datasets(
     split: str,
     session_ids: list[str],
     time_to_pixel_us: float | None,
+    augment: bool = False,
+    augment_seed_base: int | None = None,
 ) -> list[ThreeETDataset]:
+    '''
+    Build one ThreeETDataset per session id.
+
+    Args:
+        augment: If True, enable train-time augmentation (currently random
+            translation). Should only be True for the train split.
+        augment_seed_base: Base RNG seed for augmentation. Each session derives
+            its own seed as ``augment_seed_base + session_index`` so per-session
+            (dx, dy) streams are decorrelated. Ignored when ``augment`` is False.
+    '''
     datasets: list[ThreeETDataset] = []
-    for sid in session_ids:
+    for i, sid in enumerate(session_ids):
+        if augment and AUGMENT_TRANSLATE:
+            per_session_seed = (
+                augment_seed_base + i if augment_seed_base is not None else None
+            )
+            translate_px = TRANSLATE_MAX_PX
+            do_aug = True
+        else:
+            per_session_seed = None
+            translate_px = 0.0
+            do_aug = False
+
         datasets.append(
             ThreeETDataset(
                 root=data_root,
@@ -146,6 +189,10 @@ def _build_session_datasets(
                 max_num_neighbors=MAX_NUM_NEIGHBORS,
                 window_us=WINDOW_US,
                 normalize_input=NORMALIZE_INPUT,
+                include_polarity=INCLUDE_POLARITY,
+                augment_translate=do_aug,
+                translate_max_px=translate_px,
+                augment_seed=per_session_seed,
                 log=False,
             )
         )
@@ -190,9 +237,18 @@ def build_3et_datasets(
         f"{'raw µs' if TIME_TO_PIXEL_US is None else f'{float(TIME_TO_PIXEL_US):.2f} µs/px'}"
     )
 
-    train_list = _build_session_datasets(data_root, "train", train_sessions, TIME_TO_PIXEL_US)
-    val_list = _build_session_datasets(data_root, "train", val_sessions, TIME_TO_PIXEL_US)
-    test_list = _build_session_datasets(data_root, "test", all_test_sessions, TIME_TO_PIXEL_US)
+    train_list = _build_session_datasets(
+        data_root, "train", train_sessions, TIME_TO_PIXEL_US,
+        augment=True, augment_seed_base=AUGMENT_SEED,
+    )
+    val_list = _build_session_datasets(
+        data_root, "train", val_sessions, TIME_TO_PIXEL_US,
+        augment=False,
+    )
+    test_list = _build_session_datasets(
+        data_root, "test", all_test_sessions, TIME_TO_PIXEL_US,
+        augment=False,
+    )
 
     train_ds = ConcatDataset(train_list)
     val_ds = ConcatDataset(val_list)
@@ -308,7 +364,7 @@ def model_training(
     early_stop_patience: int = EARLY_STOP_PATIENCE,
     early_stop_min_delta: float = EARLY_STOP_MIN_DELTA,
 ):
-    model = SimplePupilGNN().to(device)
+    model = SimplePupilGNN(input_dim=GNN_INPUT_DIM, conv_dropout=CONV_DROPOUT).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     # delta is in the same units as graph.y (normalized units if LABEL_NORMALIZATION != None)
     criterion = torch.nn.HuberLoss(delta=HUBER_DELTA)

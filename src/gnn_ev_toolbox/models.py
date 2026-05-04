@@ -4,7 +4,7 @@ from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, SAGEC
 from torch.nn import Linear, Sequential, ReLU, Dropout, LayerNorm
 
 class SimplePupilGNN(torch.nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64, output_dim=2):
+    def __init__(self, input_dim=3, hidden_dim=64, output_dim=2, conv_dropout: float = 0.0):
         super(SimplePupilGNN, self).__init__()
         # GCN Layers (Message Passing)
         # self.conv1 = GCNConv(input_dim, hidden_dim)
@@ -22,6 +22,11 @@ class SimplePupilGNN(torch.nn.Module):
         self.norm1 = LayerNorm(hidden_dim)
         self.norm2 = LayerNorm(hidden_dim)
         self.norm3 = LayerNorm(hidden_dim)
+
+        # Per-node dropout applied after each conv->norm->relu block. Acts as
+        # regularization on the encoder side; default 0.0 keeps prior behavior
+        # for callers that don't pass conv_dropout.
+        self.conv_dropout = float(conv_dropout)
 
         # Regression Head
         # LayerNorm (not BatchNorm1d) so batch_size=1 works in training mode.
@@ -45,12 +50,15 @@ class SimplePupilGNN(torch.nn.Module):
         x = self.conv1(x, edge_index)
         x = self.norm1(x)
         x = x.relu()
+        x = F.dropout(x, p=self.conv_dropout, training=self.training)
         x = self.conv2(x, edge_index)
         x = self.norm2(x)
         x = x.relu()
+        x = F.dropout(x, p=self.conv_dropout, training=self.training)
         x = self.conv3(x, edge_index)
         x = self.norm3(x)
         x = x.relu()
+        x = F.dropout(x, p=self.conv_dropout, training=self.training)
 
         # 2. Readout layer: Pool node features into a single graph-level vector
         x_mean = global_mean_pool(x, batch, size=data.num_graphs)

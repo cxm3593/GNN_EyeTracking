@@ -191,6 +191,10 @@ class ThreeETDataset(Dataset):
         max_num_neighbors: int = 32,
         window_us: int = 100_000,
         normalize_input: bool = False,
+        include_polarity: bool = False,
+        augment_translate: bool = False,
+        translate_max_px: float = 0.0,
+        augment_seed: int | None = None,
         transform=None,
         pre_transform=None,
         pre_filter=None,
@@ -211,6 +215,24 @@ class ThreeETDataset(Dataset):
         self.time_to_pixel_us = time_to_pixel_us
         self.window_us = int(window_us)
         self.normalize_input = bool(normalize_input)
+        # When True, append a polarity channel to data.x (mapped raw {0, 1} -> {-1, +1}
+        # so the feature is mean-centered). data.pos stays 3D (xyt only) so it can be
+        # used for edge-geometry features later without polarity contaminating distances.
+        self.include_polarity = bool(include_polarity)
+
+        # Train-only random translation augmentation. Each call to get() draws a
+        # single (dx, dy) ~ Uniform(-T, T) in raw pixels and applies it to BOTH the
+        # event positions and the pupil-center label, so the (events -> pupil)
+        # relationship is preserved exactly while the absolute sensor coordinates
+        # change. Off (default) for val/test. The RNG is created from augment_seed
+        # for run-to-run reproducibility; pass a different seed per session at the
+        # call site if you want decorrelated streams across sessions.
+        self.augment_translate = bool(augment_translate)
+        self.translate_max_px = float(translate_max_px)
+        if self.augment_translate and self.translate_max_px > 0.0:
+            self._aug_rng = np.random.default_rng(augment_seed)
+        else:
+            self._aug_rng = None
 
         if label_normalization == "resolution":
             if resolution_width is None or resolution_height is None:
@@ -333,6 +355,16 @@ class ThreeETDataset(Dataset):
         t_target = actual_label_idx * 10_000
         t_start = t_target - self.window_us
 
+        # Sample one (dx, dy) per call. Drawn here (before we know whether the
+        # window ends up empty) so the RNG advances by the same amount per get()
+        # regardless of data, which keeps augmentation deterministic given seed.
+        if self._aug_rng is not None:
+            dx = float(self._aug_rng.uniform(-self.translate_max_px, self.translate_max_px))
+            dy = float(self._aug_rng.uniform(-self.translate_max_px, self.translate_max_px))
+        else:
+            dx = 0.0
+            dy = 0.0
+
         all_t = self._events_t
         start_idx = int(np.searchsorted(all_t, max(0, t_start)))
         end_idx = int(np.searchsorted(all_t, t_target))
@@ -342,6 +374,7 @@ class ThreeETDataset(Dataset):
 
         if ev_slice.size == 0:
             coords_tensor = torch.empty((0, 3), dtype=torch.float32)
+            polarity_tensor = torch.empty((0, 1), dtype=torch.float32)
         else:
             window = pd.DataFrame.from_records(ev_slice)
             # Shift time so every graph starts at 0, then (optionally) rescale so
@@ -355,12 +388,17 @@ class ThreeETDataset(Dataset):
                 t_scaled = t_rel_us
             coords = np.column_stack(
                 (
-                    window["x"].values * self.spatial_scale,
-                    window["y"].values * self.spatial_scale,
+                    window["x"].values * self.spatial_scale + dx,
+                    window["y"].values * self.spatial_scale + dy,
                     t_scaled,
                 )
             )
             coords_tensor = torch.tensor(coords, dtype=torch.float32)
+            # Map raw polarity {0, 1} -> {-1, +1} so the channel is mean-centered.
+            # We materialize this even when include_polarity=False so the empty/non-empty
+            # branches stay structurally identical; it's cheap.
+            pol_np = window["p"].values.astype(np.float32) * 2.0 - 1.0
+            polarity_tensor = torch.tensor(pol_np, dtype=torch.float32).unsqueeze(1)
 
         if coords_tensor.size(0) > 0:
             graph = self.builder.build_radius_graph(
@@ -376,15 +414,29 @@ class ThreeETDataset(Dataset):
                 edge_index=torch.empty((2, 0), dtype=torch.long),
             )
 
-        # Normalize node features and positions AFTER the radius graph is built so
-        # that GRAPH_RADIUS continues to mean what it did before (raw pixel/scaled-time
-        # units). Empty graphs are a no-op.
+        # Normalize the geometric positions in data.pos AFTER the radius graph is
+        # built, so GRAPH_RADIUS continues to mean what it did before (raw
+        # pixel / scaled-time units). data.x is rebuilt below from data.pos so the
+        # feature scale stays consistent with the position scale.
         if self._input_scale is not None:
-            graph.x = graph.x / self._input_scale
             graph.pos = graph.pos / self._input_scale
 
-        target_x = float(self._labels_df.iloc[actual_label_idx]["x"]) * self.spatial_scale
-        target_y = float(self._labels_df.iloc[actual_label_idx]["y"]) * self.spatial_scale
+        # Build the input feature tensor data.x. Polarity is *not* divided by anything
+        # — it already lives in {-1, +1} and is on the same scale as the normalized
+        # spatial/temporal channels. data.pos stays 3D (xyt) regardless of polarity
+        # so any future edge-geometry feature (e.g. relative position) doesn't get
+        # mixed with polarity.
+        if self.include_polarity:
+            graph.x = torch.cat([graph.pos, polarity_tensor], dim=1)
+        else:
+            graph.x = graph.pos
+
+        # Apply the same (dx, dy) to the target so the event->pupil relationship
+        # is preserved exactly under augmentation. y_raw is in raw pixels; the
+        # downstream label normalization will then divide by the same scale used
+        # for events, keeping things consistent.
+        target_x = float(self._labels_df.iloc[actual_label_idx]["x"]) * self.spatial_scale + dx
+        target_y = float(self._labels_df.iloc[actual_label_idx]["y"]) * self.spatial_scale + dy
         y_raw = torch.tensor([[target_x, target_y]], dtype=torch.float32)
         graph.y_raw = y_raw
 
