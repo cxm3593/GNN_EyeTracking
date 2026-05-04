@@ -44,12 +44,21 @@ SPATIAL_RESOLUTION_HEIGHT = 480
 # Set to None to keep raw µs.
 TIME_TO_PIXEL_US: float | None = 30.0
 
+# Window of events (in µs) feeding each prediction; matches the hardcoded value
+# previously used in ThreeETDataset.get(). Also drives input normalization on t.
+WINDOW_US = 100_000
+
+# When True, divide node features and positions by [W, H, t_max_in_window] AFTER
+# the radius graph is built. Keeps GRAPH_RADIUS semantics intact while putting
+# all three input channels in roughly [0, 1] for stable optimization.
+NORMALIZE_INPUT = True
+
 VAL_FRACTION = 0.2
 SPLIT_SEED = 42
 
 
 # --- Global Variables ---
-RUN_NOTE = "SAGEConv_TempSubsample5_TimeToPixel30_Radius5_HuberDelta0.05"
+RUN_NOTE = "normalized_input;LayerNorm;early_stop(SAGE_LN_InputNorm_TempSubsample5_TimeToPixel30_Radius5_HuberDelta0.05)"
 
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 2
@@ -59,6 +68,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # so delta=0.05 corresponds to ~5% of the sensor (roughly 25-30 px), a reasonable
 # threshold between the quadratic (small, precise) and linear (outlier-robust) regimes.
 HUBER_DELTA = 0.05 if LABEL_NORMALIZATION is not None else 5.0
+
+# Early-stopping: halt training when validation loss has not improved by at least
+# EARLY_STOP_MIN_DELTA for EARLY_STOP_PATIENCE consecutive epochs. Saves wall-clock
+# time without changing the trained model's quality (best checkpoint is unchanged).
+EARLY_STOP_PATIENCE = 10
+EARLY_STOP_MIN_DELTA = 1e-4
 
 SPATIAL_TEMPORAL_RATIO = 1.0 # The ratio of spatial data and temporal data, by default 1px = 1us. 
 
@@ -129,6 +144,8 @@ def _build_session_datasets(
                 graph_radius=GRAPH_RADIUS,
                 temporal_subsample=TEMPORAL_SUBSAMPLE,
                 max_num_neighbors=MAX_NUM_NEIGHBORS,
+                window_us=WINDOW_US,
+                normalize_input=NORMALIZE_INPUT,
                 log=False,
             )
         )
@@ -288,6 +305,8 @@ def model_training(
     batch_size=4,
     tensorboard_root=TENSORBOARD_ROOT,
     checkpoint_root=CHECKPOINT_ROOT,
+    early_stop_patience: int = EARLY_STOP_PATIENCE,
+    early_stop_min_delta: float = EARLY_STOP_MIN_DELTA,
 ):
     model = SimplePupilGNN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -312,6 +331,7 @@ def model_training(
     writer = SummaryWriter(log_dir=log_dir)
     global_step = 0
     best_val = float("inf")
+    epochs_since_improvement = 0
     best_path = os.path.join(ckpt_dir, "model_best.pt")
     last_path = os.path.join(ckpt_dir, "model_last.pt")
 
@@ -413,11 +433,18 @@ def model_training(
                 f"val loss={val_loss:.4f} mae={val_metrics['mae_px']:.2f}px "
                 f"l2={val_metrics['l2_px']:.2f}px"
             )
-            if val_loss < best_val:
+            if val_loss < best_val - early_stop_min_delta:
                 best_val = val_loss
+                epochs_since_improvement = 0
                 _save_checkpoint(best_path, model, epoch=epoch, metric=val_loss,
                                  extra={"selection": "best_val"})
                 print(f"  Saved best checkpoint -> {best_path} (val loss={val_loss:.4f})")
+            else:
+                epochs_since_improvement += 1
+                print(
+                    f"  No val improvement for {epochs_since_improvement}/"
+                    f"{early_stop_patience} epoch(s) (best={best_val:.4f})"
+                )
         else:
             print(
                 f"Epoch {epoch:02d} | "
@@ -427,6 +454,19 @@ def model_training(
         _save_checkpoint(last_path, model, epoch=epoch,
                          metric=val_loss if val_loader is not None else train_avg,
                          extra={"selection": "last"})
+
+        # Early stop only when we are actually tracking a validation metric.
+        if (
+            val_loader is not None
+            and early_stop_patience is not None
+            and early_stop_patience > 0
+            and epochs_since_improvement >= early_stop_patience
+        ):
+            print(
+                f"Early stopping at epoch {epoch}: no val improvement "
+                f"for {early_stop_patience} consecutive epochs (best val={best_val:.4f})."
+            )
+            break
 
     writer.close()
     print(f"Final weights: {last_path}")

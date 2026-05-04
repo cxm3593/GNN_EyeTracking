@@ -189,6 +189,8 @@ class ThreeETDataset(Dataset):
         graph_radius: float = 10.0,
         temporal_subsample: int = 5,
         max_num_neighbors: int = 32,
+        window_us: int = 100_000,
+        normalize_input: bool = False,
         transform=None,
         pre_transform=None,
         pre_filter=None,
@@ -207,6 +209,8 @@ class ThreeETDataset(Dataset):
         # time_to_pixel_us rescales event timestamps so that 1 unit of time == 1 pixel
         # of space in the graph coordinate system. None => keep raw microseconds.
         self.time_to_pixel_us = time_to_pixel_us
+        self.window_us = int(window_us)
+        self.normalize_input = bool(normalize_input)
 
         if label_normalization == "resolution":
             if resolution_width is None or resolution_height is None:
@@ -214,6 +218,28 @@ class ThreeETDataset(Dataset):
                     "label_normalization='resolution' requires resolution_width and "
                     "resolution_height to be set."
                 )
+
+        # Per-axis divisor applied to node features (data.x) and positions (data.pos)
+        # AFTER the radius graph is built, so the graph topology is unaffected by the
+        # rescaling. Keeping all three input channels in roughly [0, 1] makes
+        # optimization much more stable, and matches the "resolution" normalization
+        # used for the regression target.
+        if self.normalize_input:
+            if resolution_width is None or resolution_height is None:
+                raise ValueError(
+                    "normalize_input=True requires resolution_width and resolution_height."
+                )
+            t_scale = (
+                float(self.window_us) / float(self.time_to_pixel_us)
+                if self.time_to_pixel_us is not None
+                else float(self.window_us)
+            )
+            self._input_scale = torch.tensor(
+                [float(resolution_width), float(resolution_height), t_scale],
+                dtype=torch.float32,
+            )
+        else:
+            self._input_scale = None
 
         split_dir = os.path.join(self.root, split)
         if not os.path.isdir(split_dir):
@@ -298,13 +324,14 @@ class ThreeETDataset(Dataset):
         self._ensure_labels()
         self._ensure_events_t()
 
+        # n is the number of temporal subsamples
         n = len(self._labels_df) // self.temporal_subsample
         if idx < 0 or idx >= n:
             raise IndexError(f"Index {idx} out of range for dataset of length {n}")
 
         actual_label_idx = idx * self.temporal_subsample
         t_target = actual_label_idx * 10_000
-        t_start = t_target - 100_000
+        t_start = t_target - self.window_us
 
         all_t = self._events_t
         start_idx = int(np.searchsorted(all_t, max(0, t_start)))
@@ -348,6 +375,13 @@ class ThreeETDataset(Dataset):
                 pos=empty,
                 edge_index=torch.empty((2, 0), dtype=torch.long),
             )
+
+        # Normalize node features and positions AFTER the radius graph is built so
+        # that GRAPH_RADIUS continues to mean what it did before (raw pixel/scaled-time
+        # units). Empty graphs are a no-op.
+        if self._input_scale is not None:
+            graph.x = graph.x / self._input_scale
+            graph.pos = graph.pos / self._input_scale
 
         target_x = float(self._labels_df.iloc[actual_label_idx]["x"]) * self.spatial_scale
         target_y = float(self._labels_df.iloc[actual_label_idx]["y"]) * self.spatial_scale
