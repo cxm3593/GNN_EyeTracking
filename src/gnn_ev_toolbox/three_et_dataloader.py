@@ -195,6 +195,7 @@ class ThreeETDataset(Dataset):
         augment_translate: bool = False,
         translate_max_px: float = 0.0,
         augment_seed: int | None = None,
+        compute_edge_attr: bool = False,
         transform=None,
         pre_transform=None,
         pre_filter=None,
@@ -233,6 +234,11 @@ class ThreeETDataset(Dataset):
             self._aug_rng = np.random.default_rng(augment_seed)
         else:
             self._aug_rng = None
+
+        # When True, also compute data.edge_attr = pos[dst] - pos[src] (in the same
+        # units as data.pos, i.e. normalized if normalize_input=True). Required by
+        # GINEConv (and any conv that uses edge geometry); ignored by SAGEConv.
+        self.compute_edge_attr = bool(compute_edge_attr)
 
         if label_normalization == "resolution":
             if resolution_width is None or resolution_height is None:
@@ -430,6 +436,13 @@ class ThreeETDataset(Dataset):
             graph.x = torch.cat([graph.pos, polarity_tensor], dim=1)
         else:
             graph.x = graph.pos
+
+        # Edge features = relative position between connected nodes, in the same
+        # units as data.pos. For an empty edge_index this returns an empty (0, 3)
+        # tensor, so the shape is consistent across batches.
+        if self.compute_edge_attr:
+            src, dst = graph.edge_index[0], graph.edge_index[1]
+            graph.edge_attr = graph.pos[dst] - graph.pos[src]
 
         # Apply the same (dx, dy) to the target so the event->pupil relationship
         # is preserved exactly under augmentation. y_raw is in raw pixels; the
